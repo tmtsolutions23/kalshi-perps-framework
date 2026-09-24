@@ -116,4 +116,5 @@ are re-read each cycle. Disable with `performance.adapt_params: false`.
 
 Alerts print to stdout as `[LEVEL] [TS] message`. When run via the Hermes
 cron `no_agent` pattern, empty stdout = silent, non-empty = delivered to
-Discord. Set `alerts.*` flags in config to control noise.
+Discord alerts via Hermes cron `no_agent` pattern. See [PROGRESS.md](PROGRESS.md)
+for the full changelog and project evolution.
