@@ -1,0 +1,10 @@
+# Kalshi BTC Perps Framework — do not track runtime state or secrets
+data/
+logs/
+*.log
+__pycache__/
+*.pyc
+.env
+*.pem
+kalshi_api_config.json
+.deps_installed
