@@ -1,6 +1,6 @@
 """
-Order simulation — paper mode.
-Tracks what orders would have been placed without touching real money.
+Order simulation — paper mode with realistic fill mechanics.
+Tracks equity via state, uses bid/ask + slippage, persists stop levels.
 """
 
 import logging
@@ -12,9 +12,9 @@ log = logging.getLogger(__name__)
 
 class PaperOrderManager:
     """
-    Simulates order placement, amendment, and cancellation in paper mode.
-    Keeps an in-memory view of "what the exchange would show if we were live."
-    Positions are reconciled from the state file.
+    Simulates orders against live bid/ask prices with configurable slippage.
+    Equity is tracked in state — losses shrink it, wins grow it.
+    Stop-loss / take-profit levels are persisted on the position.
     """
 
     def __init__(self, auth, market_data, state_manager):
@@ -22,143 +22,188 @@ class PaperOrderManager:
         self.market = market_data
         self.state = state_manager
 
-    def place_limit_order(
+    def place_order(
         self,
         ticker: str,
         side: str,  # "bid" for long, "ask" for short
         count: int,
-        price: float,
-        time_in_force: str = "good_till_canceled",
-        post_only: bool = True,
-        reduce_only: bool = False,
-    ) -> dict:
+        limit_price: float,
+        bid: float,
+        ask: float,
+        slippage_bps: int = 5,
+    ) -> Optional[dict]:
         """
-        Paper-mode order placement — logs intent, updates state, does NOT call API.
-        Returns simulated response matching the API shape.
+        Paper-mode order placement with realistic fill simulation.
+        Long fills at ask + slippage; short fills at bid - slippage.
+        Returns simulated {order_id, fill_price, fill_count, position} or None.
         """
+        if side == "bid":
+            fill_price = ask * (1 + slippage_bps / 10000)
+            if limit_price and fill_price > limit_price:
+                log.info("PAPER: limit $%.4f below fill $%.4f — no fill", limit_price, fill_price)
+                return None
+        else:
+            fill_price = bid * (1 - slippage_bps / 10000)
+            if limit_price and fill_price < limit_price:
+                log.info("PAPER: limit $%.4f above fill $%.4f — no fill", limit_price, fill_price)
+                return None
+
         order_id = f"paper_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
-        client_id = f"client_{order_id}"
-
-        entry = {
-            "ticker": ticker,
-            "side": side,
-            "count": f"{count}.00",
-            "price": f"{price:.4f}",
-            "time_in_force": time_in_force,
-            "post_only": post_only,
-            "reduce_only": reduce_only,
-            "client_order_id": client_id,
-        }
-
-        # Update state with pending order
-        self.state.update(
-            pending_order={
-                "order_id": order_id,
-                "client_order_id": client_id,
-                "ticker": ticker,
-                "side": side,
-                "count": count,
-                "price": price,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-        log.info(
-            "PAPER ORDER: %s %d @ %.4f (%s) — %s",
-            side.upper(), count, price, ticker, time_in_force,
-        )
-
-        return {
-            "order_id": order_id,
-            "client_order_id": client_id,
-            "fill_count": "0.00",
-            "remaining_count": f"{count}.00",
-        }
-
-    def simulate_fill(self, fill_price: float, fill_count: int):
-        """
-        Simulate a fill of the pending order (e.g., market moved to our limit).
-        Updates state to show an open position.
-        """
-        pending = self.state.get().get("pending_order")
-        if not pending:
-            log.warning("No pending order to simulate fill for")
-            return None
-
-        side = "long" if pending["side"] == "bid" else "short"
+        direction = "long" if side == "bid" else "short"
+        fees = round(count * fill_price * 0.0005, 2)
 
         pos = {
-            "ticker": pending["ticker"],
-            "side": side,
+            "ticker": ticker,
+            "side": direction,
             "entry_price": fill_price,
-            "size": fill_count,
+            "size": count,
             "entry_ts": datetime.now(timezone.utc).isoformat(),
-            "entry_order_id": pending["order_id"],
+            "entry_order_id": order_id,
+            "entry_notional": round(count * fill_price, 2),
+            "fees_paid": fees,
             "unrealized_pnl": 0.0,
-            "entry_notional": round(fill_count * fill_price, 2),
-            "fees": round(fill_count * fill_price * 0.0005, 2),  # est 5bps taker
+            "stop_loss_price": None,
+            "take_profit_price": None,
+            "trail_activate_price": None,
+            "trail_bps": None,
+            "trail_watermark": None,
         }
 
-        self.state.update(
-            current_position=pos,
-            pending_order=None,
-        )
+        self.state.update(current_position=pos, pending_order=None)
 
         log.info(
-            "PAPER FILL: %s %d @ %.4f — position opened",
-            side.upper(), fill_count, fill_price,
+            "PAPER FILL: %s %d @ $%.4f (slip %dbps) — notional $%.0f",
+            direction.upper(), count, fill_price, slippage_bps, pos["entry_notional"],
         )
-        return pos
+        return {"order_id": order_id, "fill_price": fill_price, "fill_count": count, "position": pos}
 
-    def simulate_exit(self, exit_price: float, exit_count: int) -> Optional[dict]:
-        """Simulate closing the current position. Records trade in history."""
+    def set_stops(self, stop_loss: float = None, take_profit: float = None,
+                  trail_bps: int = None, trail_activate_price: float = None):
+        """Persist stop/take-profit/trailing levels on the current position."""
         pos = self.state.get().get("current_position")
         if not pos:
-            log.warning("No position to exit")
+            log.warning("No position to set stops on")
+            return
+        if stop_loss is not None:
+            pos["stop_loss_price"] = stop_loss
+        if take_profit is not None:
+            pos["take_profit_price"] = take_profit
+        if trail_bps is not None:
+            pos["trail_bps"] = trail_bps
+            pos["trail_activate_price"] = trail_activate_price
+            pos["trail_watermark"] = pos.get("entry_price")
+        self.state.save()
+        log.info("PAPER STOPS: SL=%s TP=%s trail=%s", stop_loss, take_profit, trail_bps)
+
+    def check_stops(self, current_price: float, high_water: float) -> Optional[str]:
+        """
+        Check all stop/TP/trailing levels. Return exit_reason string or None.
+        Trailing: once high_water passes trail_activate_price, ratchet a stop
+        trail_bps behind the best watermark seen.
+        """
+        pos = self.state.get().get("current_position")
+        if not pos:
             return None
 
-        pnl = round(
-            (exit_price - pos["entry_price"]) * pos["size"]
-            if pos["side"] == "long"
-            else (pos["entry_price"] - exit_price) * pos["size"],
-            2,
-        )
-        fees = round(exit_count * exit_price * 0.0005, 2)
-        net_pnl = round(pnl - fees, 2)
+        side = pos["side"]
+        sl = pos.get("stop_loss_price")
+        tp = pos.get("take_profit_price")
+        trail_bps = pos.get("trail_bps")
+        trail_activate = pos.get("trail_activate_price")
+        watermark = pos.get("trail_watermark", pos["entry_price"])
 
-        trade_record = {
+        if not sl and not tp and not trail_bps:
+            return None
+
+        # Stop loss
+        if sl and ((side == "long" and current_price <= sl) or
+                   (side == "short" and current_price >= sl)):
+            return f"Stop loss at ${current_price:.2f} (SL ${sl:.2f})"
+
+        # Take profit
+        if tp and ((side == "long" and current_price >= tp) or
+                   (side == "short" and current_price <= tp)):
+            return f"Take profit at ${current_price:.2f} (TP ${tp:.2f})"
+
+        # Trailing stop
+        if trail_bps and trail_activate:
+            if side == "long":
+                new_water = max(watermark, high_water)
+                if high_water >= trail_activate:
+                    pos["trail_watermark"] = new_water
+                    trail_price = new_water * (1 - trail_bps / 10000)
+                    if current_price <= trail_price:
+                        return f"Trailing stop at ${current_price:.2f} (${trail_bps}bps from ${new_water:.2f})"
+            else:
+                new_water = min(watermark, high_water)
+                if high_water <= trail_activate:
+                    pos["trail_watermark"] = new_water
+                    trail_price = new_water * (1 + trail_bps / 10000)
+                    if current_price >= trail_price:
+                        return f"Trailing stop at ${current_price:.2f} (${trail_bps}bps from ${new_water:.2f})"
+
+        return None
+
+    def close_position(self, exit_price: float, reason: str = "manual") -> Optional[dict]:
+        """Close position at exit_price. Records trade, updates state.equity."""
+        pos = self.state.get().get("current_position")
+        if not pos:
+            return None
+
+        size = pos["size"]
+        entry = pos["entry_price"]
+        raw_pnl = (exit_price - entry) * size if pos["side"] == "long" else (entry - exit_price) * size
+        exit_fees = round(size * exit_price * 0.0005, 2)
+        entry_fees = pos.get("fees_paid", 0)
+        total_fees = entry_fees + exit_fees
+        net_pnl = round(raw_pnl - total_fees, 2)
+
+        # Update equity
+        state = self.state.get()
+        state["equity"] = round(state.get("equity", 10000.0) + net_pnl, 2)
+
+        trade = {
             "ticker": pos["ticker"],
             "side": pos["side"],
-            "entry_price": pos["entry_price"],
+            "entry_price": entry,
             "exit_price": exit_price,
-            "size": pos["size"],
+            "size": size,
             "entry_ts": pos["entry_ts"],
             "exit_ts": datetime.now(timezone.utc).isoformat(),
-            "pnl": pnl,
-            "fees": fees,
+            "raw_pnl": round(raw_pnl, 2),
+            "entry_fees": entry_fees,
+            "exit_fees": exit_fees,
+            "total_fees": total_fees,
             "net_pnl": net_pnl,
+            "reason": reason,
         }
-
-        self.state.add_trade(trade_record)
+        self.state.add_trade(trade)
         self.state.update(current_position=None, pending_order=None)
 
         log.info(
-            "PAPER EXIT: %s %d @ %.4f — PnL: $%.2f (net: $%.2f)",
-            pos["side"].upper(), exit_count, exit_price, pnl, net_pnl,
+            "PAPER CLOSE: %s %d @ $%.2f — raw $%.2f fees $%.2f net $%.2f equity $%.2f",
+            pos["side"].upper(), size, exit_price, raw_pnl, total_fees, net_pnl, state["equity"],
         )
-        return trade_record
+        return trade
 
-    def cancel_pending(self):
-        """Cancel any pending order."""
-        self.state.update(pending_order=None)
-        log.info("PAPER CANCEL: pending order cleared")
+    def apply_funding(self, rate: float, notional: float, side: str) -> float:
+        """
+        Apply funding P&L. Short receives when rate > 0; long pays.
+        Returns the dollar amount.
+        """
+        amount = -rate * notional if side == "long" else rate * notional
+        state = self.state.get()
+        state["equity"] = round(state.get("equity", 10000.0) + amount, 2)
+        state["last_funding_applied_ts"] = datetime.now(timezone.utc).isoformat()
+        self.state.save()
+        log.info("PAPER FUNDING: $%.2f → equity $%.2f", amount, state["equity"])
+        return amount
 
     def get_position(self) -> Optional[dict]:
-        """Get the current simulated position."""
         return self.state.get().get("current_position")
 
     def has_position(self) -> bool:
         return self.state.get().get("current_position") is not None
 
-    def has_pending(self) -> bool:
-        return self.state.get().get("pending_order") is not None
+    def cancel_pending(self):
+        self.state.update(pending_order=None)
