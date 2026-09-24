@@ -14,22 +14,25 @@ import copy
 log = logging.getLogger(__name__)
 
 DEFAULT_STATE = {
-    "version": 1,
+    "version": 2,
     "last_run_ts": None,           # ISO timestamp of last successful cycle
-    "last_funding_check_ts": None, # when we last evaluated funding
-    "cycle_count": 0,              # total evaluation cycles run
-    "error_count": 0,              # consecutive errors (reset on success)
-    "max_error_count": 5,          # too many errors → alert + pause
-    "paused": False,               # manual or circuit-breaker pause
+    "last_funding_applied_ts": None,
+    "last_daily_check_ts": None,   # date used for daily drawdown anchor
+    "cycle_count": 0,
+    "error_count": 0,
+    "max_error_count": 5,
+    "paused": False,
     "pause_reason": None,
-    "daily_pnl": 0.0,              # today's realized PnL
-    "daily_start_balance": None,   # balance at start of today
-    "peak_balance": None,          # all-time peak for drawdown calc
-    "current_position": None,      # { ticker, side, entry_price, size, entry_ts, ... }
-    "pending_order": None,         # { client_order_id, ticker, side, count, price, ts }
-    "active_tpsl": None,           # { stop_loss, take_profit, trailing_bps }
-    "trade_history": [],           # last N trades [{ entry_ts, exit_ts, side, pnl, ... }]
-    "params": {},                  # live strategy parameters (may be adapted)
+    "equity": 10000.0,             # paper trading equity (seeded + funded P&L)
+    "peak_equity": 10000.0,        # for drawdown computation
+    "daily_start_equity": 10000.0, # today's opening equity
+    "current_position": None,      # { ticker, side, entry_price, size, entry_ts,
+                                   #   stop_loss_price, take_profit_price,
+                                   #   trail_activate_price, trail_bps, trail_watermark,
+                                   #   entry_notional, fees_paid }
+    "pending_order": None,
+    "trade_history": [],
+    "params": {},
 }
 
 

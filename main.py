@@ -1,30 +1,31 @@
 """
 Kalshi BTC Perps Trading Framework — Main Loop
 ================================================
-Orchestrates market data → strategy → execution → alerting in a
-self-healing, state-persistent cycle.
+Orchestrates market data → stop check → funding → strategy → execution → alerting
+in a self-healing, state-persistent cycle with realistic paper simulation.
+
+P0 fixes applied per audit:
+  - Stop loss / take profit / trailing enforced each cycle (P0-1)
+  - Equity tracked in state, drawdown circuit breakers active (P0-2)
+  - Funding P&L accrued on open positions each cycle (P0-3)
+  - Fills use bid/ask + slippage, entry+exit fees on net PnL (P0-4)
 
 Run modes:
   - Once (cron):  python main.py
   - Loop:         python main.py --loop
   - Override:     python main.py --strategy=mean_reversion --leverage=3.0
-
-All state persists in data/state.json for crash recovery.
 """
 
 import argparse
-import json
 import logging
 import sys
 import time
 import traceback
 from datetime import datetime, timezone, date
-from pathlib import Path
 from typing import Optional
 
 import yaml
 
-# ── core modules ─────────────────────────────────────────────────────────
 from core.auth import KalshiAuth
 from core.market import MarketData
 from core.state import StateManager
@@ -37,18 +38,12 @@ log = logging.getLogger("perps")
 
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
-        cfg = yaml.safe_load(f)
-    # Env var overrides
-    if "KALSHI_PERPS_KEY_CONFIG" in cfg.setdefault("kalshi", {}):
-        pass  # already set
-    return cfg
+        return yaml.safe_load(f)
 
 
 def import_strategy(name: str):
-    """Dynamically import a strategy module by name."""
     import importlib
     module = importlib.import_module(f"strategies.{name}")
-    # Find the strategy class
     for attr in dir(module):
         cls = getattr(module, attr)
         if isinstance(cls, type) and hasattr(cls, "evaluate") and attr != "BaseStrategy":
@@ -57,7 +52,7 @@ def import_strategy(name: str):
 
 
 class PerpsLoop:
-    """The core evaluation loop — ties everything together."""
+    """Core evaluation loop."""
 
     def __init__(self, config_path: str = "config.yaml"):
         self.cfg = load_config(config_path)
@@ -65,7 +60,6 @@ class PerpsLoop:
         ticker = self.cfg["market"]["ticker"]
         kalshi_cfg = self.cfg["kalshi"]
 
-        # Core instances
         self.auth = KalshiAuth(
             key_config_path=kalshi_cfg["key_config"],
             private_key_path=kalshi_cfg["key_path"],
@@ -77,20 +71,14 @@ class PerpsLoop:
         self.orders = PaperOrderManager(self.auth, self.market, self.state)
         self.alerts = AlertDispatcher(self.cfg, self.state)
 
-        # Strategy
         strategy_name = self.cfg["strategy"]["name"]
-        strategy_cls = import_strategy(strategy_name)
-        self.strategy = strategy_cls(self.cfg["strategy"].get("params", {}))
-
-        # Runtime state
+        self.strategy = import_strategy(strategy_name)(self.cfg["strategy"].get("params", {}))
         self.ticker = ticker
-        self.contract_size = 0.0001  # KXBTCPERP fixed
         self._cycle_start = None
 
-    # ── Self-healing helpers ─────────────────────────────────────────────
+    # ── Self-healing ─────────────────────────────────────────────────────
 
     def _safe_api_call(self, fn, *args, retries=3, **kwargs):
-        """Wrapper with exponential backoff for any API call."""
         last_err = None
         for attempt in range(retries):
             try:
@@ -99,29 +87,27 @@ class PerpsLoop:
                 last_err = e
                 if attempt < retries - 1:
                     wait = 2 ** attempt
-                    log.warning("API call failed (attempt %d/%d): %s — retrying in %ds", 
+                    log.warning("API call failed (attempt %d/%d): %s — retry in %ds",
                                 attempt + 1, retries, e, wait)
                     time.sleep(wait)
                 else:
                     log.error("API call failed after %d retries: %s", retries, e)
         raise last_err
 
-    def _reconcile_position(self):
-        """Verify our state matches what the exchange reports (paper mode: just log)."""
+    def _reconcile(self):
         state = self.state.get()
         pos = state.get("current_position")
         if pos:
-            log.info("Position held: %s %d @ %.4f",
-                     pos.get("side", "?"), pos.get("size", 0), pos.get("entry_price", 0))
+            log.info("Position: %s %d @ %.4f (SL=%s TP=%s)",
+                     pos["side"], pos["size"], pos["entry_price"],
+                     pos.get("stop_loss_price"), pos.get("take_profit_price"))
         else:
-            log.info("Position: flat")
+            log.info("Position: flat — equity=$%.2f", state.get("equity", 10000))
 
     # ── Data fetching ────────────────────────────────────────────────────
 
     def _fetch_snapshot(self) -> Optional[dict]:
-        """Fetch all data needed for one evaluation cycle. Returns None on failure."""
         try:
-            # Market data (public, no auth needed)
             market = self._safe_api_call(self.market.get_market, self.ticker)
             mkt = market.get("market", market)
             price = float(mkt.get("price", 0))
@@ -130,12 +116,11 @@ class PerpsLoop:
             mark = float(mkt.get("settlement_mark_price", {}).get("price", price))
             lev_est = mkt.get("leverage_estimate")
 
-            # Candles
-            candles_resp = self._safe_api_call(self.market.get_candlesticks,
-                                                self.ticker, period_minutes=60, limit=200)
+            candles_resp = self._safe_api_call(
+                self.market.get_candlesticks, self.ticker, period_minutes=60, limit=200
+            )
             candles = candles_resp.get("candlesticks", [])
 
-            # Funding
             try:
                 fund = self._safe_api_call(self.market.get_funding_rate_estimate, self.ticker)
                 fund_rate = fund.get("funding_rate")
@@ -144,23 +129,13 @@ class PerpsLoop:
                 fund_rate = None
                 next_fund_ts = None
 
-            # Balance and position (authenticated)
-            available = 0.0
-            if self.mode == "paper":
-                available = 10000.0  # paper starting balance
-                # Use state's simulated balance
-                state = self.state.get()
-                if state.get("peak_balance") is None:
-                    state["peak_balance"] = available
-                    state["daily_start_balance"] = available
-                    self.state.save()
+            state = self.state.get()
+            equity = state.get("equity", 10000.0)
+            current_pos = state.get("current_position")
+            recent_trades = state.get("trade_history", [])[-30:]
+            live_params = state.get("params", {})
 
-            current_pos = self.state.get().get("current_position")
-
-            recent_trades = self.state.get().get("trade_history", [])[-30:]
-
-            # Live params from state (self-adapted)
-            live_params = self.state.get().get("params", {})
+            self.risk._snapshot_price = price
 
             return {
                 "price": price,
@@ -170,21 +145,57 @@ class PerpsLoop:
                 "candles": candles,
                 "funding_rate": fund_rate,
                 "next_funding_ts": next_fund_ts,
-                "available_balance": available,
+                "available_balance": equity,
                 "current_position": current_pos,
                 "leverage_estimate": lev_est,
                 "recent_trades": recent_trades,
                 "live_params": live_params,
+                "high_24h": float(mkt.get("ask", 0)),
             }
-
         except Exception as e:
-            log.error("Failed to fetch market snapshot: %s", e)
+            log.error("Failed to fetch snapshot: %s", e)
             return None
+
+    # ── Funding accrual (P0-3) ──────────────────────────────────────────
+
+    def _accrue_funding(self, state_snapshot: dict):
+        """
+        Apply funding P&L for funding events elapsed since last check.
+        Kalshi funding occurs every 8h at 12AM/8AM/4PM ET.
+        """
+        pos = self.state.get().get("current_position")
+        if not pos:
+            return
+
+        rate = state_snapshot.get("funding_rate")
+        if rate is None or rate == 0:
+            return
+
+        notional = pos.get("entry_notional", 0)
+        if notional <= 0:
+            return
+
+        self.orders.apply_funding(rate, notional, pos["side"])
+
+    # ── Stop checking (P0-1) ─────────────────────────────────────────────
+
+    def _check_stops(self, snapshot: dict) -> Optional[str]:
+        """Check if stops/trailing are hit. Returns exit reason or None."""
+        pos = self.orders.get_position()
+        if not pos:
+            return None
+
+        price = snapshot["price"]
+        high_water = max(snapshot.get("price", 0), pos.get("entry_price", 0))
+        if pos["side"] == "short":
+            high_water = min(snapshot.get("price", 0), pos.get("entry_price", 0))
+
+        return self.orders.check_stops(price, high_water)
 
     # ── Adaptation ───────────────────────────────────────────────────────
 
     def _adapt_strategy(self):
-        """Self-iteration: tune strategy parameters based on recent trade performance."""
+        """Self-iteration: tune params based on recent trades."""
         state = self.state.get()
         trades = state.get("trade_history", [])
         adapt_cfg = self.cfg.get("performance", {})
@@ -192,8 +203,8 @@ class PerpsLoop:
         if not adapt_cfg.get("adapt_params", True):
             return
 
-        min_trades = adapt_cfg.get("adaptation_min_trades", 10)
-        lookback = adapt_cfg.get("adaptation_lookback", 30)
+        min_trades = adapt_cfg.get("adaptation_min_trades", 30)
+        lookback = adapt_cfg.get("adaptation_lookback", 50)
 
         if len(trades) < min_trades:
             return
@@ -202,186 +213,200 @@ class PerpsLoop:
         wins = sum(1 for t in recent if t.get("net_pnl", 0) > 0)
         losses = len(recent) - wins
         win_rate = wins / len(recent) if recent else 0.5
-        avg_win = sum(t.get("net_pnl", 0) for t in recent if t.get("net_pnl", 0) > 0) / max(wins, 1)
-        avg_loss = abs(sum(t.get("net_pnl", 0) for t in recent if t.get("net_pnl", 0) < 0)) / max(losses, 1)
-        profit_factor = avg_win / max(avg_loss, 0.01)
+
+        # True profit factor = sum(wins) / sum(|losses|)
+        sum_wins = sum(t.get("net_pnl", 0) for t in recent if t.get("net_pnl", 0) > 0)
+        sum_losses = abs(sum(t.get("net_pnl", 0) for t in recent if t.get("net_pnl", 0) < 0))
+        profit_factor = sum_wins / max(sum_losses, 0.01)
 
         params = state.setdefault("params", {})
         adapted = False
 
-        # Adjust leverage based on win rate
-        if win_rate < 0.35:
-            # Losing too much — reduce leverage
+        # Cooldown: only adapt once per 5 cycles
+        last_adapt = params.get("_last_adapt_cycle", 0)
+        current_cycle = state.get("cycle_count", 0)
+        if current_cycle - last_adapt < 5:
+            return
+
+        # Leverage adjustments: cut fast on losses, raise slowly on wins
+        if win_rate < 0.35 and profit_factor < 0.8:
             new_lev = max(2.0, float(params.get("leverage", 4.0)) - 0.5)
             if new_lev != params.get("leverage"):
                 params["leverage"] = new_lev
+                params["_last_adapt_cycle"] = current_cycle
                 adapted = True
-                log.info("Adaptation: lowering leverage to %.1fx (win rate %.0f%%)", new_lev, win_rate * 100)
-        elif win_rate > 0.65:
-            new_lev = min(4.0, float(params.get("leverage", 2.0)) + 0.5)
+                log.info("Adapt: lower lev to %.1fx (WR %.0f%% PF %.1f)", new_lev, win_rate * 100, profit_factor)
+        elif win_rate > 0.60 and profit_factor > 1.5:
+            new_lev = min(4.0, float(params.get("leverage", 2.0)) + 0.25)
             if new_lev != params.get("leverage"):
                 params["leverage"] = new_lev
+                params["_last_adapt_cycle"] = current_cycle
                 adapted = True
-                log.info("Adaptation: raising leverage to %.1fx (win rate %.0f%%)", new_lev, win_rate * 100)
+                log.info("Adapt: raise lev to %.1fx (WR %.0f%% PF %.1f)", new_lev, win_rate * 100, profit_factor)
 
-        # Adjust pullback threshold based on profit factor
-        if profit_factor < 0.8:
-            # Tighten entries when PnL isn't making up for losses
+        # Tighten entry if mis-trading (using true PF)
+        if profit_factor < 0.7:
             new_pullback = max(0.1, float(params.get("pullback", 0.3)) - 0.05)
             if new_pullback != params.get("pullback"):
                 params["pullback"] = new_pullback
+                params["_last_adapt_cycle"] = current_cycle
                 adapted = True
-                log.info("Adaptation: tightening pullback to %.2f (PF %.1f)", new_pullback, profit_factor)
+                log.info("Adapt: tighten pullback to %.2f (PF %.1f)", new_pullback, profit_factor)
         elif profit_factor > 2.0 and win_rate > 0.5:
             new_pullback = min(0.5, float(params.get("pullback", 0.3)) + 0.05)
             if new_pullback != params.get("pullback"):
                 params["pullback"] = new_pullback
+                params["_last_adapt_cycle"] = current_cycle
                 adapted = True
-                log.info("Adaptation: loosening pullback to %.2f (PF %.1f)", new_pullback, profit_factor)
+                log.info("Adapt: loosen pullback to %.2f (PF %.1f)", new_pullback, profit_factor)
 
         if adapted:
             self.state.save()
 
-    # ── Execution ────────────────────────────────────────────────────────
+    # ── Signal execution ─────────────────────────────────────────────────
 
     def _execute_signal(self, signal, snapshot: dict):
-        """Execute a strategy signal in paper mode."""
         price = snapshot["price"]
+        bid = snapshot["bid"]
+        ask = snapshot["ask"]
+        slippage = self.cfg.get("execution", {}).get("slippage_bps", 5)
 
         if signal.action == "enter_long":
-            count, lev = self.risk.compute_position_size(
-                snapshot["available_balance"],
-                price,
-                signal.suggested_leverage or 4.0,
-            )
+            count, lev = self.risk.compute_position_size(signal.suggested_leverage or 4.0)
             if count <= 0:
-                log.info("Entry skipped: position sizing returned 0 (circuit breaker?)")
+                log.info("Entry long skipped — sizing returned 0")
                 return
 
-            self.orders.place_limit_order(self.ticker, "bid", count, price)
-            self.orders.simulate_fill(price, count)
-            self.alerts.entry("long", price, count, lev, signal.reason)
+            result = self.orders.place_order(self.ticker, "bid", count, price, bid, ask, slippage)
+            if result:
+                pos = result["position"]
+                # Persist stops from strategy
+                self.orders.set_stops(
+                    stop_loss=signal.suggested_stop_loss,
+                    take_profit=signal.suggested_take_profit,
+                )
+                self.alerts.entry("long", result["fill_price"], count, lev, signal.reason)
+                log.info("Entry fees: $%.2f", pos.get("fees_paid", 0))
 
         elif signal.action == "enter_short":
-            count, lev = self.risk.compute_position_size(
-                snapshot["available_balance"],
-                price,
-                signal.suggested_leverage or 4.0,
-            )
+            count, lev = self.risk.compute_position_size(signal.suggested_leverage or 4.0)
             if count <= 0:
                 return
-            self.orders.place_limit_order(self.ticker, "ask", count, price)
-            self.orders.simulate_fill(price, count)
-            self.alerts.entry("short", price, count, lev, signal.reason)
+
+            result = self.orders.place_order(self.ticker, "ask", count, price, bid, ask, slippage)
+            if result:
+                pos = result["position"]
+                self.orders.set_stops(
+                    stop_loss=signal.suggested_stop_loss,
+                    take_profit=signal.suggested_take_profit,
+                )
+                self.alerts.entry("short", result["fill_price"], count, lev, signal.reason)
 
         elif signal.action == "exit":
             pos = self.orders.get_position()
             if pos:
-                size = pos.get("size", 0)
-                trade = self.orders.simulate_exit(price, size)
+                trade = self.orders.close_position(price, reason=signal.reason)
                 if trade:
                     self.strategy.on_trade_completed(trade)
                     self.alerts.exit(pos["side"], price, trade["net_pnl"], signal.reason)
             else:
-                log.info("Exit signal but no position to close")
-
-        elif signal.action == "hold":
-            if snapshot.get("current_position"):
-                log.info("HOLD: %s", signal.reason)
-            else:
-                log.debug("HOLD (flat): %s", signal.reason)
+                log.info("Exit signal but no position")
 
     # ── Main cycle ───────────────────────────────────────────────────────
 
     def run_cycle(self) -> bool:
-        """
-        Execute one complete evaluation cycle.
-        Returns True if successful, False on unhandled error.
-        """
         self._cycle_start = datetime.now(timezone.utc)
         log.info("=== Cycle start ===")
 
         try:
-            # 1. Check if paused
             if self.state.is_paused():
                 reason = self.state.get().get("pause_reason", "unknown")
-                log.warning("Trading paused: %s", reason)
-                self.alerts.error(f"Trading paused: {reason}")
-                return True  # not a crash, just paused
+                log.warning("Paused: %s", reason)
+                self.alerts.error(f"Paused: {reason}")
+                return True
 
-            # 2. Fetch snapshot (self-healing retries built in)
-            snapshot_data = self._fetch_snapshot()
-            if snapshot_data is None:
-                log.error("Failed to fetch snapshot — recording error")
-                should_pause = self.state.record_error()
-                if should_pause:
-                    self.alerts.error(f"Paused after {self.state.get().get('error_count')} consecutive fetch failures")
+            # Fetch data
+            sd = self._fetch_snapshot()
+            if sd is None:
+                if self.state.record_error():
+                    self.alerts.error(f"Paused after {self.state.get()['error_count']} errors")
                 return False
 
-            price = snapshot_data["price"]
+            price = sd["price"]
             if price <= 0:
-                log.error("Invalid price ($%.2f) — skipping cycle", price)
+                log.error("Invalid price $%.2f", price)
                 self.state.record_error()
                 return False
 
-            log.info("BTC: $%.2f | bid=$%.2f ask=$%.2f | funding=%s",
-                     price, snapshot_data["bid"], snapshot_data["ask"],
-                     snapshot_data.get("funding_rate", "N/A"))
+            log.info("BTC: $%.4f | bid=$%.4f ask=$%.4f | funding=%s | equity=$%.2f",
+                     price, sd["bid"], sd["ask"], sd.get("funding_rate", "?"),
+                     self.state.get().get("equity", 10000))
 
-            # 3. Reconcile known state
-            self._reconcile_position()
+            # Reconcile
+            self._reconcile()
 
-            # 4. Build market snapshot for strategy
+            # P0-3: Accrue funding
+            self._accrue_funding(sd)
+
+            # P0-1: Check stops before strategy evaluation
+            stop_reason = self._check_stops(sd)
+            if stop_reason:
+                trade = self.orders.close_position(price, reason=stop_reason)
+                if trade:
+                    self.strategy.on_trade_completed(trade)
+                    self.alerts.exit(
+                        trade["side"], price, trade["net_pnl"],
+                        f"STOP HIT: {stop_reason}",
+                    )
+                # Position closed — re-read state
+                sd["current_position"] = None
+
+            # Build strategy snapshot
             from strategies.base import MarketSnapshot
             ms = MarketSnapshot(
                 ticker=self.ticker,
                 current_price=price,
-                bid=snapshot_data["bid"],
-                ask=snapshot_data["ask"],
-                mark_price=snapshot_data["mark"],
-                candles_1h=snapshot_data["candles"],
-                funding_rate=snapshot_data.get("funding_rate"),
-                next_funding_ts=snapshot_data.get("next_funding_ts"),
-                available_balance=snapshot_data["available_balance"],
-                current_position=snapshot_data["current_position"],
-                current_leverage_estimate=snapshot_data.get("leverage_estimate"),
-                live_params=snapshot_data.get("live_params", {}),
-                recent_trades=snapshot_data.get("recent_trades", []),
+                bid=sd["bid"],
+                ask=sd["ask"],
+                mark_price=sd["mark"],
+                candles_1h=sd["candles"],
+                funding_rate=sd.get("funding_rate"),
+                next_funding_ts=sd.get("next_funding_ts"),
+                available_balance=sd["available_balance"],
+                current_position=sd["current_position"],
+                current_leverage_estimate=sd.get("leverage_estimate"),
+                live_params=sd.get("live_params", {}),
+                recent_trades=sd.get("recent_trades", []),
             )
 
-            # 5. Run strategy
+            # Strategy
             signal = self.strategy.evaluate(ms)
-
             log.info("Signal: %s (conf=%.2f) — %s", signal.action, signal.confidence, signal.reason)
 
-            # 6. Alert on signal
             if signal.action in ("enter_long", "enter_short"):
-                self.alerts.signal(
-                    f"{signal.action.replace('enter_', '').upper()} signal "
-                    f"(conf={signal.confidence:.0%}) — {signal.reason}",
-                )
+                self.alerts.signal(f"{signal.action.replace('enter_', '').upper()} signal (conf={signal.confidence:.0%}) — {signal.reason}")
             elif signal.action == "exit":
                 self.alerts.signal(f"EXIT signal — {signal.reason}")
 
-            # 7. Execute (paper mode)
+            # Execute
             if self.mode == "paper":
-                self._execute_signal(signal, snapshot_data)
+                self._execute_signal(signal, sd)
             else:
-                log.info("Live mode — not yet implemented, pending perps access")
+                log.info("Live mode — pending perps access")
 
-            # 8. Self-adaptation
+            # Adapt
             self._adapt_strategy()
 
-            # 9. Record success, flush alerts
+            # Done
             self.state.record_success()
             self.alerts.flush()
 
             elapsed = (datetime.now(timezone.utc) - self._cycle_start).total_seconds()
-            log.info("=== Cycle complete (%.1fs) ===", elapsed)
+            log.info("=== Cycle done (%.1fs) ===", elapsed)
             return True
 
         except Exception as e:
-            log.error("Unhandled error in cycle: %s", e)
+            log.error("Cycle failed: %s", e)
             log.debug(traceback.format_exc())
             self.state.record_error()
             self.alerts.error(f"Cycle failed: {e}")
@@ -389,56 +414,41 @@ class PerpsLoop:
             return False
 
     def run_loop(self, interval_minutes: int = 240):
-        """Run in continuous loop mode."""
-        log.info("Starting continuous loop (interval=%d min)", interval_minutes)
+        log.info("Continuous loop (interval=%d min)", interval_minutes)
         while True:
             self.run_cycle()
-            log.info("Sleeping %d minutes...", interval_minutes)
+            log.info("Sleeping %d min...", interval_minutes)
             time.sleep(interval_minutes * 60)
 
     def close(self):
-        """Clean shutdown — save state, flush alerts."""
         self.state.save()
         self.alerts.flush()
-        log.info("Shutdown complete")
+        log.info("Shutdown")
 
-
-# ── CLI entry point ──────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi BTC Perps Trading Framework")
-    parser.add_argument("--loop", action="store_true", help="Run in continuous loop mode")
-    parser.add_argument("--interval", type=int, default=240, help="Loop interval in minutes (default: 240)")
-    parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
-    parser.add_argument("--strategy", help="Override strategy name")
-    parser.add_argument("--leverage", type=float, help="Override max leverage")
-    parser.add_argument("--mode", choices=["paper", "live"], help="Override mode")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval", type=int, default=240)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--strategy")
+    parser.add_argument("--leverage", type=float)
+    parser.add_argument("--mode", choices=["paper", "live"])
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    # Logging setup
     level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 
-    # Override config
-    if args.strategy:
-        with open(args.config) as f:
-            cfg = yaml.safe_load(f)
-        cfg["strategy"]["name"] = args.strategy
-        with open(args.config, "w") as f:
-            yaml.dump(cfg, f)
-
-    # Build and run
+    # Hold overrides in memory — don't rewrite config file (P4 fix)
     engine = PerpsLoop(config_path=args.config)
-
     if args.leverage:
         engine.cfg.setdefault("risk", {})["max_leverage"] = args.leverage
     if args.mode:
         engine.mode = args.mode
+    if args.strategy:
+        engine.strategy = import_strategy(args.strategy)(engine.cfg["strategy"].get("params", {}))
+        engine.cfg["strategy"]["name"] = args.strategy  # runtime only
 
     try:
         if args.loop:

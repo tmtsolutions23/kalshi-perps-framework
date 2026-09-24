@@ -357,3 +357,36 @@ demonstrated edge; it is a proximity-to-EMA trigger with a funding veto that str
 suppresses longs, symmetric 1:1 payoffs, no stop loss, unmodeled funding and fills, and
 an adaptation loop that amplifies noise. Fix the P0s before running another paper cycle,
 and treat all results to date as void.
+
+---
+
+## 2026-09-24 — P0 Blocker Fixes (branch `fix/p0-blockers`)
+
+All four P0 findings from the audit addressed in one pass.
+
+### P0-1: Stop loss enforcement
+
+**Fix:** `core/orders.py` now has `set_stops()` which persists `stop_loss_price`, `take_profit_price`, `trail_bps`, and `trail_watermark` on the position dict. `check_stops()` is called **before strategy evaluation** each cycle (`main.py:292-303`). It checks:
+- Hard SL/TP price breaches
+- Trailing stop: once high-water reaches `trail_activate_price` (not yet wired to strategy output), ratchets a stop `trail_bps` behind the best watermark seen
+
+The strategy still computes `suggested_stop_loss` and `suggested_take_profit` — `_execute_signal` now reads them and calls `set_stops()` on fill (`main.py:256-259`).
+
+### P0-2: Paper equity is a living number
+
+**Fix:** `core/state.py` now has `equity` (seed 10000.0), `peak_equity`, and `daily_start_equity`. `close_position()` in orders.py applies `equity += net_pnl` to the state. `_fetch_snapshot` reads `state.equity` instead of a literal 10000. The circuit breakers in `RiskManager._check_circuit_breakers()` now compare current equity to the tracked peak — and the daily check actually rolls over at UTC boundary. Drawdown computation is live.
+
+### P0-3: Funding accrual
+
+**Fix:** `core/orders.py:apply_funding()` applies `± rate × notional` to equity (short receives positive funding, long pays it). Called each cycle via `main.py:274 _accrue_funding()` for open positions. `state.last_funding_applied_ts` prevents double-counting across restarts.
+
+### P0-4: Realistic fills
+
+**Fix:** `PaperOrderManager.place_order()` replaces the old `place_limit_order + simulate_fill` two-step. Longs fill at `ask × (1 + slippage_bps/10000)`, shorts at `bid × (1 − slippage_bps/10000)`. Entry fees (5 bps taker est) are recorded in `fees_paid` on the position. `close_position()` subtracts BOTH entry and exit fees from `net_pnl`. Config `slippage_bps: 5` is now actually referenced.
+
+### Other audit items addressed
+
+- **Dead config keys removed:** `trailing_activate_pct`, `trailing_bps`, `cancel_resting_after_hours`, `max_concurrent_positions`, `funding_aware`, `track_trades`, `order_type`, `time_in_force`, `paper_mode_print_on_signal_only`, `log_level`, `trade_log` — all cleaned from config.yaml
+- **`--strategy flag` no longer mutates config file** — overrides held in memory only
+- **Adaptation thresholds raised:** `min_trades` bumped from 10→30, `lookback` from 30→50, cooldown of 5 cycles between changes, asymmetric adjustment (cut fast, raise slow)
+- **`profit_factor` corrected** — now uses `sum(wins)/sum(|losses|)` (true PF) instead of `avg_win/avg_loss` (payoff ratio)

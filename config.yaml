@@ -4,64 +4,53 @@
 # ──────────────────────────────────────────────────────────
 
 mode: paper                          # paper | live
+
 market:
   ticker: KXBTCPERP                 # BTC perp ticker
-  reference: btc                     # for display/plotting
 
 strategy:
   name: funding_momentum             # which strategy module to load
-  params:                            # passed to strategy constructor
-    fast_ema_period: 12              # hours (on 1h candles)
+  params:
+    fast_ema_period: 12
     slow_ema_period: 48
-    min_funding_bias: 0.0001         # min |funding rate| to override EMA
-    atr_period: 14                   # for stop placement
-    atr_multiplier_sl: 1.5           # stop loss = ATR * this
-    atr_multiplier_tp: 1.5           # take profit = ATR * this
-    pullback_threshold: 0.3          # retrace from EMA as % of ATR
-    trailing_activate_pct: 3.0       # % profit before trailing activates
-    trailing_bps: 200                # trailing stop distance in bps
-    max_position_hours: 168          # 7 days — force close if held longer
+    min_funding_bias: 0.0001
+    atr_period: 14
+    atr_multiplier_sl: 1.5           # stop loss = ATR × this
+    atr_multiplier_tp: 1.5           # take profit = ATR × this
+    pullback_threshold: 0.3          # pullback entry: within pullback×ATR of fast EMA
+    max_position_hours: 168          # force close if held longer
 
 risk:
-  max_leverage: 4.0                  # hard cap
-  min_leverage: 2.0                  # hard floor
-  account_fraction_per_trade: 0.25  # max 25% of available balance per entry
-  max_concurrent_positions: 1        # BTC only, keep it simple
-  max_daily_drawdown_pct: 10.0      # pause trading for the day if hit
-  max_total_drawdown_pct: 25.0      # pause until manual reset if hit
-  circuit_breaker_drawdown_pct: 15.0 # daily CB — stops all new entries
+  max_leverage: 4.0
+  min_leverage: 2.0
+  account_fraction_per_trade: 0.25
+  risk_per_trade_pct: 0.01           # 1% of equity per trade (risk-first sizing)
+  max_daily_drawdown_pct: 10.0
+  max_total_drawdown_pct: 25.0
+  circuit_breaker_drawdown_pct: 15.0
 
 execution:
-  order_type: limit                  # limit | market
-  slippage_bps: 5                    # for limit orders, offset from mid
-  time_in_force: good_till_canceled  # gtc | ioc | fok
-  cancel_resting_after_hours: 2      # cancel unfilled GTC orders after N hours
+  slippage_bps: 5
 
 schedule:
-  check_interval_minutes: 240        # 4 hours between evaluation cycles
-  funding_aware: true                # align runs around funding events (8h)
-  paper_mode_print_on_signal_only: true  # stdout only when a signal fires
+  check_interval_minutes: 240
 
 performance:
-  track_trades: true                 # save trade history to trades.jsonl
-  log_level: info                    # debug | info | warn | error
-  max_trade_history: 200             # keep last N trades in state
-  adapt_params: true                 # auto-tweak strategy after N trades
-  adaptation_min_trades: 10          # min trades before adaptation kicks in
-  adaptation_lookback: 30            # evaluate last N trades for adaptation
+  adapt_params: true
+  adaptation_min_trades: 30          # min trades before adaptation kicks in
+  adaptation_lookback: 50            # evaluate last N trades
+  max_trade_history: 200
 
 alerts:
-  on_signal: true                    # notify on new signal (buy/sell)
-  on_entry: true                     # notify when entering a position
-  on_exit: true                      # notify when exiting
-  on_error: true                     # notify on API/strategy errors
-  on_drawdown_warning: true          # notify on drawdown threshold breach
-  heartbeat: false                   # periodic "still alive" (recommended: false)
-  heartbeat_interval_hours: 24       # only if heartbeat is true
+  on_signal: true
+  on_entry: true
+  on_exit: true
+  on_error: true
+  on_drawdown_warning: true
+  heartbeat: false
 
 paths:
   state_file: data/state.json
-  trade_log: data/trades.jsonl
   log_file: data/perps.log
 
 kalshi:
