@@ -18,6 +18,7 @@ Run modes:
 
 import argparse
 import logging
+import math
 import sys
 import time
 import traceback
@@ -32,6 +33,7 @@ from core.state import StateManager
 from core.risk import RiskManager
 from core.orders import PaperOrderManager
 from alerts.discord import AlertDispatcher
+from backtest.engine import PerformanceTracker
 
 log = logging.getLogger("perps")
 
@@ -75,6 +77,9 @@ class PerpsLoop:
         self.strategy = import_strategy(strategy_name)(self.cfg["strategy"].get("params", {}))
         self.ticker = ticker
         self._cycle_start = None
+        self._tracker = PerformanceTracker(self.state)
+        self._btc_start_recorded = False
+        self._last_metrics_print = None
 
     # ── Self-healing ─────────────────────────────────────────────────────
 
@@ -194,6 +199,17 @@ class PerpsLoop:
 
     # ── Adaptation ───────────────────────────────────────────────────────
 
+    def _win_rate_ci(self, wins: int, n: int) -> tuple:
+        """95% Wilson confidence interval for win rate. Returns (lower, upper)."""
+        if n == 0:
+            return 0, 1
+        z = 1.96
+        p = wins / n
+        denominator = 1 + z**2 / n
+        centre = (p + z**2 / (2 * n)) / denominator
+        margin = z * math.sqrt((p * (1 - p) / n) + z**2 / (4 * n**2)) / denominator
+        return (centre - margin, centre + margin)
+
     def _adapt_strategy(self):
         """Self-iteration: tune params based on recent trades."""
         state = self.state.get()
@@ -219,6 +235,11 @@ class PerpsLoop:
         sum_losses = abs(sum(t.get("net_pnl", 0) for t in recent if t.get("net_pnl", 0) < 0))
         profit_factor = sum_wins / max(sum_losses, 0.01)
 
+        # P3-1: 95% CI on win rate — must exclude 0.5 to act on WR signals
+        ci_lower, ci_upper = self._win_rate_ci(wins, len(recent))
+        wr_reliable = ci_lower > 0.5  # reliably above 50% (CI doesn't include 0.5)
+        wr_losing = ci_upper < 0.5     # reliably below 50%
+
         params = state.setdefault("params", {})
         adapted = False
 
@@ -228,15 +249,24 @@ class PerpsLoop:
         if current_cycle - last_adapt < 5:
             return
 
+        # P3-3: Out-of-sample validation — split trades into train (60%) / validate (40%)
+        oos_split = max(3, int(len(recent) * 0.4))
+        train_set = recent[:-oos_split] if oos_split > 0 else recent
+        val_set = recent[-oos_split:] if oos_split > 0 else []
+        val_wins = sum(1 for t in val_set if t.get("net_pnl", 0) > 0)
+        val_sum_wins = sum(t.get("net_pnl", 0) for t in val_set if t.get("net_pnl", 0) > 0)
+        val_sum_losses = abs(sum(t.get("net_pnl", 0) for t in val_set if t.get("net_pnl", 0) < 0))
+        val_pf = val_sum_wins / max(val_sum_losses, 0.01) if val_set else profit_factor
+
         # Leverage adjustments: cut fast on losses, raise slowly on wins
-        if win_rate < 0.35 and profit_factor < 0.8:
+        if (wr_losing or (win_rate < 0.35 and profit_factor < 0.8)):
             new_lev = max(2.0, float(params.get("leverage", 4.0)) - 0.5)
             if new_lev != params.get("leverage"):
                 params["leverage"] = new_lev
                 params["_last_adapt_cycle"] = current_cycle
                 adapted = True
                 log.info("Adapt: lower lev to %.1fx (WR %.0f%% PF %.1f)", new_lev, win_rate * 100, profit_factor)
-        elif win_rate > 0.60 and profit_factor > 1.5:
+        elif wr_reliable and profit_factor > 1.5:
             new_lev = min(4.0, float(params.get("leverage", 2.0)) + 0.25)
             if new_lev != params.get("leverage"):
                 params["leverage"] = new_lev
@@ -244,15 +274,15 @@ class PerpsLoop:
                 adapted = True
                 log.info("Adapt: raise lev to %.1fx (WR %.0f%% PF %.1f)", new_lev, win_rate * 100, profit_factor)
 
-        # Tighten entry if mis-trading (using true PF)
-        if profit_factor < 0.7:
+        # Tighten entry if mis-trading (using true PF) — confirmed on OOS window
+        if profit_factor < 0.7 and (len(val_set) < 2 or val_pf < 1.0):
             new_pullback = max(0.1, float(params.get("pullback", 0.3)) - 0.05)
             if new_pullback != params.get("pullback"):
                 params["pullback"] = new_pullback
                 params["_last_adapt_cycle"] = current_cycle
                 adapted = True
                 log.info("Adapt: tighten pullback to %.2f (PF %.1f)", new_pullback, profit_factor)
-        elif profit_factor > 2.0 and win_rate > 0.5:
+        elif profit_factor > 2.0 and wr_reliable and (len(val_set) < 2 or val_pf > 1.5):
             new_pullback = min(0.5, float(params.get("pullback", 0.3)) + 0.05)
             if new_pullback != params.get("pullback"):
                 params["pullback"] = new_pullback
@@ -271,8 +301,20 @@ class PerpsLoop:
         ask = snapshot["ask"]
         slippage = self.cfg.get("execution", {}).get("slippage_bps", 5)
 
+        # Check entry allowed before acting
+        allowed, reason = self.risk.check_entry_allowed()
+        if signal.action in ("enter_long", "enter_short") and not allowed:
+            log.info("Entry blocked: %s", reason)
+            self.alerts.drawdown_warning(reason)
+            return
+
         if signal.action == "enter_long":
-            count, lev = self.risk.compute_position_size(signal.suggested_leverage or 4.0)
+            # P4: scale size by signal confidence
+            base_lev = signal.suggested_leverage or 4.0
+            confidence = getattr(signal, "confidence", 0.5)
+            adj_lev = max(2.0, base_lev * (0.5 + confidence * 0.5))  # scale 0.75x-1x of base
+
+            count, lev = self.risk.compute_position_size(adj_lev)
             if count <= 0:
                 log.info("Entry long skipped — sizing returned 0")
                 return
@@ -280,16 +322,18 @@ class PerpsLoop:
             result = self.orders.place_order(self.ticker, "bid", count, price, bid, ask, slippage)
             if result:
                 pos = result["position"]
-                # Persist stops from strategy
                 self.orders.set_stops(
                     stop_loss=signal.suggested_stop_loss,
                     take_profit=signal.suggested_take_profit,
                 )
                 self.alerts.entry("long", result["fill_price"], count, lev, signal.reason)
-                log.info("Entry fees: $%.2f", pos.get("fees_paid", 0))
 
         elif signal.action == "enter_short":
-            count, lev = self.risk.compute_position_size(signal.suggested_leverage or 4.0)
+            base_lev = signal.suggested_leverage or 4.0
+            confidence = getattr(signal, "confidence", 0.5)
+            adj_lev = max(2.0, base_lev * (0.5 + confidence * 0.5))
+
+            count, lev = self.risk.compute_position_size(adj_lev)
             if count <= 0:
                 return
 
@@ -337,6 +381,11 @@ class PerpsLoop:
                 log.error("Invalid price $%.2f", price)
                 self.state.record_error()
                 return False
+
+            # P2-5: Record BTC start price for benchmark
+            if not self._btc_start_recorded:
+                self._tracker.set_btc_start_price(price)
+                self._btc_start_recorded = True
 
             log.info("BTC: $%.4f | bid=$%.4f ask=$%.4f | funding=%s | equity=$%.2f",
                      price, sd["bid"], sd["ask"], sd.get("funding_rate", "?"),
@@ -396,6 +445,11 @@ class PerpsLoop:
 
             # Adapt
             self._adapt_strategy()
+
+            # P2-4: Print performance summary if we have trades
+            summary = self._tracker.summary_text(price)
+            if summary:
+                self.alerts.signal(summary)
 
             # Done
             self.state.record_success()

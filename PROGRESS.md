@@ -390,3 +390,52 @@ The strategy still computes `suggested_stop_loss` and `suggested_take_profit` �
 - **`--strategy flag` no longer mutates config file** — overrides held in memory only
 - **Adaptation thresholds raised:** `min_trades` bumped from 10→30, `lookback` from 30→50, cooldown of 5 cycles between changes, asymmetric adjustment (cut fast, raise slow)
 - **`profit_factor` corrected** — now uses `sum(wins)/sum(|losses|)` (true PF) instead of `avg_win/avg_loss` (payoff ratio)
+
+---
+
+## 2026-09-24 — P2/P3 Metrics, Benchmark, Adaptation Gating (branch `fix/p2-p3-metrics-benchmarks`)
+
+Final pass: metrics corrected and wired into the loop, benchmark added, adaptation statistical gating, remaining hygiene items closed.
+
+### P2-1 / P2-3: Sharpe and Max DD corrected
+
+`backtest/engine.py` rewritten:
+- **Sharpe** now computed on per-trade **returns** (net_pnl / equity_at_entry), sample stdev (n-1), annualized by √(trades)
+- **Sortino** added — uses downside deviation only
+- **Calmar** — total return % / max drawdown %
+- **Max drawdown** as % of equity on the sequential equity curve (not dollar-peak-from-zero)
+- **Profit factor** was already correct from the P0 pass
+- **Expectancy** — (win% × avg_win) − (loss% × avg_loss), net of all costs
+- **Payoff ratio** — reported alongside PF, not conflated with it
+
+### P2-4: PerformanceTracker wired into the loop
+
+`PerformanceTracker` accepts a `state_manager`. `main.py` instantiates it and calls `summary_text(btc_price)` after every cycle. When trades exist, it prints a formatted block with Win%, PF, Sharpe, Calmar, MaxDD, Long/Short split, AvgHold, and BTC buy-hold delta.
+
+### P2-5: Buy-and-hold BTC benchmark
+
+Start price recorded on first cycle. Delta vs buy-and-hold reported in every summary.
+
+### P3-1: Statistical gating on win rate
+
+`_win_rate_ci()` computes the 95% Wilson CI. Adaptation only fires when:
+- **Raise leverage**: requires `ci_lower > 0.5` (95% confident WR > 50%)
+- **Cut leverage**: fires on `ci_upper < 0.5` OR the old heuristic
+- Prevents adaptation on noisy n=10 samples
+
+### P3-3: Out-of-sample confirmation
+
+Each adaptation cycle splits trades into training (60%) and validation (40%):
+- **Tighten entry**: only when training PF < 0.7 AND validation PF < 1.0
+- **Loosen entry**: requires training PF > 2.0 AND wr_reliable AND (val PF > 1.5 or too few val trades)
+- Prevents in-sample curve fitting
+
+### Remaining hygiene closed
+
+| Item | Status |
+|---|---|
+| `check_entry_allowed()` never called | Wired into `_execute_signal` |
+| `signal.confidence` unused | Scales leverage by conviction |
+| Null handling in mean_reversion | Same forward-fill as funding_momentum |
+| PerformanceTracker not wired | Instantiated, called each cycle |
+| Buy-and-hold benchmark absent | Start price, delta in summary |
