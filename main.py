@@ -398,7 +398,8 @@ class PerpsLoop:
                 log.info("Entry long skipped — sizing returned 0")
                 return
 
-            result = self.orders.place_order(self.ticker, "bid", count, price, bid, ask, slippage)
+            # Paper mode: use market-order fill (no limit constraint, cross spread)
+            result = self.orders.place_order(self.ticker, "bid", count, 0, bid, ask, slippage)
             if result:
                 pos = result["position"]
                 # R2-2: pass trailing stop params from strategy signal to set_stops
@@ -419,7 +420,7 @@ class PerpsLoop:
             if count <= 0:
                 return
 
-            result = self.orders.place_order(self.ticker, "ask", count, price, bid, ask, slippage)
+            result = self.orders.place_order(self.ticker, "ask", count, 0, bid, ask, slippage)
             if result:
                 pos = result["position"]
                 self.orders.set_stops(
