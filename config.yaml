@@ -33,7 +33,7 @@ execution:
   slippage_bps: 5
 
 schedule:
-  check_interval_minutes: 240
+  check_interval_minutes: 60
 
 performance:
   adapt_params: true

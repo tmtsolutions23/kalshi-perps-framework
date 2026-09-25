@@ -528,3 +528,35 @@ All findings from Claude's round-2 audit addressed.
 - **R2-12 Stale `high_24h`**: Removed from `_fetch_snapshot`.
 - **R2-13 Confidence comment**: Corrected to match actual code (`0.5 + conf × 0.5` = 0.5x-1x).
 - **R2-14 Empty `=` file**: Deleted from repo.
+
+---
+
+## 2026-09-25 — PB-EMA Trend Strategy & Cadence (committed directly to main)
+
+### PB-EMA strategy replaces funding-conflict as default
+
+New `strategies/pb_ema_trend.py` uses PB-EMA(50) on daily candles to determine the trend regime:
+
+- **UP regime** (close > blended EMA of high×0.7+close×0.3) → long-only entries
+  - Pullback entry: price retraces to EMA12 within ATR band
+  - Breakout entry: price accelerates away from EMA12 (momentum check)
+- **DOWN regime** (close < EMA50 of close) → short-only entries
+  - Pullback entry + breakdown entry (mirror of longs)
+- **NEUTRAL regime** (inside channel) → hold, no trades
+- **Funding**: used for extreme exits only — removed from entry logic entirely
+- **Blended top line** (w=0.7) narrows neutral zone from 19% → 11% for ~40% more trade time
+
+### Cadence changed from 4h to 1h
+
+Audit data showed:
+- Median pullback lasts 2 hours — at 4h we missed 88% of pullbacks
+- 36% of 4h windows see price moves exceeding stop distance (gap risk)
+- At 1h: 0% missed pullbacks, ~9% stop gap risk, 24 API calls/day (trivial)
+- Config updated, cron job `47c8dfe1c7c5` moved from `every 4h` to `every 1h`
+
+### Audit findings fixed
+
+- Removed unused `import math as _math` from `_compute_pb_ema_regime`
+- Removed unused `bo_runup` variable from `pb_ema_trend.py`
+- Verified all 11 smoke tests pass including PB-EMA regime assertions
+- Verified live cycle detects UP regime and fires long pullback

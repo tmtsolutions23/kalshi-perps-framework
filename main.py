@@ -236,9 +236,8 @@ class PerpsLoop:
         Uses blended top line: EMA50(high × 0.7 + close × 0.3) for narrower neutral zone.
         Returns: 'UP' | 'DOWN' | 'NEUTRAL'
         """
-        import math as _math
         period = 50
-        blend_w = 0.7  # R2-15: blend weight for PB-EMA top line
+        blend_w = 0.7
 
         if len(daily_candles) < period:
             return "UNKNOWN"
@@ -255,20 +254,19 @@ class PerpsLoop:
         if len(highs) < period:
             return "UNKNOWN"
 
-        # Compute EMAs
-        def _ema(values):
-            k = 2 / (period + 1)
+        close_slice = closes[-period:]
+        blended = [highs[-period + i] * blend_w + closes[-period + i] * (1 - blend_w)
+                   for i in range(period)]
+
+        def ema(values, p=period):
+            k = 2 / (p + 1)
             e = values[0]
             for v in values[1:]:
                 e = v * k + e * (1 - k)
             return e
 
-        close_slice = closes[-period:]
-        blended = [highs[-(period - i)] * blend_w + closes[-(period - i)] * (1 - blend_w)
-                   for i in range(period)]
-
-        ema_top = _ema(blended)
-        ema_bot = _ema(close_slice)
+        ema_top = ema(blended)
+        ema_bot = ema(close_slice)
         last_close = closes[-1]
 
         if last_close > ema_top:

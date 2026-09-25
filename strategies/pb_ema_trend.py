@@ -142,7 +142,6 @@ class PBEMATrendStrategy(BaseStrategy):
         # Regime-based params
         pb_threshold = snapshot.live_params.get("pullback", self.params.get("pullback_threshold", 0.3))
         bo_threshold = snapshot.live_params.get("breakout", self.params.get("breakout_threshold", 0.4))
-        bo_runup = self.params.get("breakout_min_runup_atr", 0.5)
 
         if has_position:
             pos_side = snapshot.current_position.get("side", "")
