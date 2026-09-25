@@ -390,3 +390,68 @@ The strategy still computes `suggested_stop_loss` and `suggested_take_profit` �
 - **`--strategy flag` no longer mutates config file** — overrides held in memory only
 - **Adaptation thresholds raised:** `min_trades` bumped from 10→30, `lookback` from 30→50, cooldown of 5 cycles between changes, asymmetric adjustment (cut fast, raise slow)
 - **`profit_factor` corrected** — now uses `sum(wins)/sum(|losses|)` (true PF) instead of `avg_win/avg_loss` (payoff ratio)
+
+---
+
+## 2026-09-24 — P1 Strategy Math Fixes (branch `fix/p1-strategy-math`)
+
+Eight remaining P1 issues from the audit addressed in one pass.
+
+### P1-1: Funding filter — confirmation, not veto
+
+**Before:** Funding could only cancel trades, never initiate them. The entry gate required `bias == trend`, but funding already overrode trend — so the only possible outcome was a stricter version of the trend bias. Combined with funding being positive ~98% of the time, the strategy was structurally short-only, ignoring 46% of events.
+
+**Fix:** Funding is now a *confirmation* filter. When |funding| >= min_funding_bias, it must agree with the trend direction. When funding is neutral (< min_funding), the trend alone decides. This means:
+- Uptrend + positive funding (common) → **both agree on long** → enters long (previously blocked!)
+- Downtrend + positive funding → both agree on short → enters short
+- Neutral funding → follows trend
+
+Now trades both directions and passes the audit test: uptrend + positive funding with a pullback actually enters.
+
+### P1-2: Funding exit threshold — dynamic instead of hardcoded
+
+**Before:** Required `abs(fund) > min_funding * 5 = 0.0005` to exit. Only 2 of 339 historical events exceeded this — dead code.
+
+**Fix:** Uses `min_funding * 3` as the exit threshold (~90th percentile of empirical distribution). Exit fires when funding strongly opposes the position (e.g., long position while funding is positive > 3× threshold).
+
+### P1-3: Risk-first sizing wired end-to-end
+
+**Before:** `risk.py` had `set_atr()` and `_last_atr` but nothing ever called them. Stop distance fell back to a hardcoded 1.5% of price.
+
+**Fix:** Strategy now stores `_cached_atr` after each successful computation. `main.py` reads it after strategy evaluation and passes to `risk.set_atr()` (P1-3 wiring). The risk manager uses it for `risk_dollars / stop_distance` sizing.
+
+### P1-4: Directional pullback entry
+
+**Before:** `abs(ema_distance_atr) <= pullback_threshold` — symmetric proximity band, fires on breakouts in either direction. Longs and shorts used identical logic.
+
+**Fix:** Longs now require `ema_distance_atr <= pullback_threshold` (price at or below the EMA — actual pullback down). Shorts require `ema_distance_atr >= -pullback_threshold` (price at or above the EMA — actual pullback up).
+
+### P1-5: Asymmetric reward:risk
+
+**Before:** `atr_multiplier_sl = atr_multiplier_tp = 1.5` — 1:1 gross payoff. With 11 bps round-trip costs eating 10% of the 109 bps gross target, needed ~55% win rate to break even.
+
+**Fix:** Changed TP multiplier to 2.0 (SL stays at 1.5) — 2:1.5 ≈ 1.33:1 asymmetric payoff. Now break-even win rate ≈ 43% (assuming 10% cost drag on the SL leg).
+
+### P1-6: ATR OHLC source
+
+**Before:** Used `ask.high` and `bid.low` for ATR computation — these embed the spread, producing a wider-than-true range that mixes quote noise with actual volatility.
+
+**Fix:** `_compute_atr()` now reads from `price.high`, `price.low`, and `price.previous` — the actual trade price data.
+
+### P1-7: ATR fallback — refuse to fabricate
+
+**Before:** When ATR was `None`, silently fell back to `price * 0.02` — 2.7× wider than the real ~0.73% ATR(14). No log line, no warning.
+
+**Fix:** Strategy caches the last valid ATR (`_cached_atr`). When current ATR computation fails, it reuses the cache. If no cache exists (cold start), returns `hold` with reason — refuses to trade on a fabricated volatility estimate.
+
+### P1-8: Null candle close handling
+
+**Before:** `dict.get("close", 0)` returned `None` when the key existed with a null value — `float(None)` raised `TypeError`, caught by `except: continue`, silently dropping bars from the series.
+
+**Fix:** `_build_prices()` explicitly checks `close is None`, forward-fills from `price.previous` or the previous candle's close. Logs a warning with count of filled nulls. Asserts final series length.
+
+### P1-9: Mean reversion stops and funding gate
+
+**Before:** Mean reversion had no stop loss — 2σ entry, up to 4× leverage, exit only on reversion to 0.2σ or the 48h timeout. Its funding gate (`fund <= 0` / `fund >= 0`) was the same structurally short-only veto as P1-1.
+
+**Fix:** Hard stop at entry ± 3×ATR, trailing stop for exits. Funding gate removed — mean reversion at 2σ is a legitimate signal regardless of funding direction. Config params absent from `config.yaml` will be added in the next config pass
