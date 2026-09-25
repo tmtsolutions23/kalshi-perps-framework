@@ -131,6 +131,7 @@ class PaperOrderManager:
                 new_water = max(watermark, high_water)
                 if high_water >= trail_activate:
                     pos["trail_watermark"] = new_water
+                    self.state.save()  # R2-10: persist watermark mutation
                     trail_price = new_water * (1 - trail_bps / 10000)
                     if current_price <= trail_price:
                         return f"Trailing stop at ${current_price:.2f} (${trail_bps}bps from ${new_water:.2f})"
@@ -138,6 +139,7 @@ class PaperOrderManager:
                 new_water = min(watermark, high_water)
                 if high_water <= trail_activate:
                     pos["trail_watermark"] = new_water
+                    self.state.save()  # R2-10
                     trail_price = new_water * (1 + trail_bps / 10000)
                     if current_price >= trail_price:
                         return f"Trailing stop at ${current_price:.2f} (${trail_bps}bps from ${new_water:.2f})"
@@ -161,6 +163,12 @@ class PaperOrderManager:
         # Update equity
         state = self.state.get()
         state["equity"] = round(state.get("equity", 10000.0) + net_pnl, 2)
+
+        # Append to equity timeline (R2-8)
+        timeline = state.setdefault("equity_timeline", [])
+        timeline.append({"ts": datetime.now(timezone.utc).isoformat(), "equity": state["equity"], "source": "trade"})
+        if len(timeline) > 1000:
+            state["equity_timeline"] = timeline[-500:]
 
         trade = {
             "ticker": pos["ticker"],
@@ -186,15 +194,21 @@ class PaperOrderManager:
         )
         return trade
 
-    def apply_funding(self, rate: float, notional: float, side: str) -> float:
+    def apply_funding(self, rate: float, notional: float, side: str, events: int = 1) -> float:
         """
-        Apply funding P&L. Short receives when rate > 0; long pays.
+        Apply funding P&L for `events` funding periods (default 1).
+        Short receives when rate > 0; long pays.
         Returns the dollar amount.
         """
-        amount = -rate * notional if side == "long" else rate * notional
+        amount = -rate * notional * events if side == "long" else rate * notional * events
         state = self.state.get()
         state["equity"] = round(state.get("equity", 10000.0) + amount, 2)
         state["last_funding_applied_ts"] = datetime.now(timezone.utc).isoformat()
+        # Append to equity timeline (R2-8)
+        timeline = state.setdefault("equity_timeline", [])
+        timeline.append({"ts": datetime.now(timezone.utc).isoformat(), "equity": state["equity"], "source": "funding"})
+        if len(timeline) > 1000:
+            state["equity_timeline"] = timeline[-500:]
         self.state.save()
         log.info("PAPER FUNDING: $%.2f → equity $%.2f", amount, state["equity"])
         return amount

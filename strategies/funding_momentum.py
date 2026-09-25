@@ -200,8 +200,8 @@ class FundingMomentumStrategy(BaseStrategy):
             # ── Entry logic ──────────────────────────────────────────
 
             if bias == "long":
-                # P1-4: directional pullback — long wants price AT or BELOW the EMA
-                if ema_distance_atr <= pullback_threshold:
+                # R2-3: bounded band — long wants price near or below EMA, not arbitrarily far
+                if -1.0 <= ema_distance_atr <= pullback_threshold:
                     sl_price = price - (atr * self.params.get("atr_multiplier_sl", 1.5))
                     tp_price = price + (atr * self.params.get("atr_multiplier_tp", 2.0))
                     confidence = min(1.0, trend_strength / 2.0) * (0.5 if funding_bias else 1.0)
@@ -220,8 +220,8 @@ class FundingMomentumStrategy(BaseStrategy):
                     )
 
             elif bias == "short":
-                # P1-4: directional pullback — short wants price AT or ABOVE the EMA
-                if ema_distance_atr >= -pullback_threshold:
+                # R2-3: bounded band — short wants price near or above EMA, not arbitrarily far
+                if -pullback_threshold <= ema_distance_atr <= 1.0:
                     sl_price = price + (atr * self.params.get("atr_multiplier_sl", 1.5))
                     tp_price = price - (atr * self.params.get("atr_multiplier_tp", 2.0))
                     confidence = min(1.0, trend_strength / 2.0) * (0.5 if funding_bias else 1.0)
@@ -261,13 +261,12 @@ class FundingMomentumStrategy(BaseStrategy):
             if pos_side == "short" and uptrend:
                 return Signal("exit", reason="Trend reversed to uptrend")
 
-            # Exit on extreme funding against the position (P1-2: adaptive threshold)
-            # Use 3x the min_funding threshold (empirically covers ~90th percentile)
+            # Exit on extreme funding against the position (R2-6: fixed inverted strings)
             if abs(fund) >= min_funding * 3:
                 if pos_side == "long" and fund > 0:
-                    return Signal("exit", reason=f"Funding strongly positive ({fund:.6f}) — shorts crowded")
+                    return Signal("exit", reason=f"Funding strongly positive ({fund:.6f}) — longs crowded")
                 if pos_side == "short" and fund < 0:
-                    return Signal("exit", reason=f"Funding strongly negative ({fund:.6f}) — longs crowded")
+                    return Signal("exit", reason=f"Funding strongly negative ({fund:.6f}) — shorts crowded")
 
             return Signal("hold", reason=f"Holding {pos_side}")
 

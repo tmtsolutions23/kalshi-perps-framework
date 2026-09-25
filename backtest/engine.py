@@ -58,14 +58,32 @@ class PerformanceTracker:
         expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
         payoff_ratio = abs(avg_win / max(avg_loss, 0.01)) if avg_loss != 0 else float("inf")
 
-        # Build equity curve from sequential trades (sorted by exit_ts)
+        # Build equity curve from state.equity_timeline (includes funding, R2-8)
         sorted_by_ts = sorted(
             [t for t in trades if t.get("exit_ts") and t.get("net_pnl") is not None],
             key=lambda t: t.get("exit_ts", ""),
         )
-        equity_curve = [SEED_EQUITY]
-        for t in sorted_by_ts:
-            equity_curve.append(equity_curve[-1] + t["net_pnl"])
+        timeline = state.get("equity_timeline", [])
+        if timeline:
+            equity_curve = [SEED_EQUITY]
+            for pt in timeline:
+                equity_curve.append(pt["equity"])
+            timestamps = []
+            for pt in timeline:
+                try:
+                    timestamps.append(datetime.fromisoformat(pt["ts"]))
+                except (ValueError, TypeError):
+                    timestamps.append(None)
+        else:
+            # Fallback: reconstruct from trade PnL only (excludes funding)
+            equity_curve = [SEED_EQUITY]
+            timestamps = []
+            for t in sorted_by_ts:
+                equity_curve.append(equity_curve[-1] + t["net_pnl"])
+                try:
+                    timestamps.append(datetime.fromisoformat(t.get("exit_ts", "")))
+                except (ValueError, TypeError):
+                    timestamps.append(None)
 
         # Returns from equity curve (per-trade returns)
         returns = []
@@ -74,20 +92,27 @@ class PerformanceTracker:
             if prev > 0:
                 returns.append((equity_curve[i] - prev) / prev)
 
-        # Sharpe (P2-1): on returns, sample stdev, annualized)
+        # Sharpe (R2-7): annualized by elapsed time, not sqrt(total trades)
         if len(returns) >= 2:
             mean_r = sum(returns) / len(returns)
             var_r = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
-            sharpe = (mean_r / math.sqrt(var_r)) * math.sqrt(n) if var_r > 0 else 0
+
+            # Compute elapsed days from trade timestamps
+            elapsed_days = 0
+            if timestamps and timestamps[0] and timestamps[-1]:
+                elapsed_days = (timestamps[-1] - timestamps[0]).total_seconds() / 86400
+            periods_per_year = max((n / max(elapsed_days, 1) * 365.25) if elapsed_days > 0 else math.sqrt(n), 0.01)
+
+            sharpe = (mean_r / math.sqrt(var_r)) * math.sqrt(periods_per_year) if var_r > 0 else 0
         else:
             sharpe = 0
 
-        # Sortino
+        # Sortino (same time-based annualization)
         if len(returns) >= 2:
             downside = [r for r in returns if r < 0]
             if downside:
                 dd_var = sum(r ** 2 for r in downside) / (len(downside) - 1) if len(downside) > 1 else sum(r ** 2 for r in downside) / max(len(downside), 1)
-                sortino = (mean_r / math.sqrt(dd_var)) * math.sqrt(n) if dd_var > 0 else 0
+                sortino = (mean_r / math.sqrt(dd_var)) * math.sqrt(periods_per_year) if dd_var > 0 else 0
             else:
                 sortino = float("inf") if len(returns) > 0 else 0
         else:

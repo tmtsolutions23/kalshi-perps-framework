@@ -47,13 +47,14 @@ class RiskManager:
         risk_pct = self.cfg.get("risk_per_trade_pct", 0.01)  # 1% default
         risk_dollars = equity * risk_pct
 
-        # Use ATR from the last cycle estimate or 1.5% of price as stop distance
-        stop_dist = getattr(self, "_last_atr", price * 0.015)
+        # R2-4: stop_dist must match actual SL placement (atr × atr_multiplier_sl)
+        sl_mult = self.cfg.get("atr_multiplier_sl", 1.5)
+        stop_dist = getattr(self, "_last_atr", price * 0.015) * sl_mult
         if stop_dist <= 0:
-            stop_dist = price * 0.015
+            stop_dist = price * 0.015 * sl_mult
 
         contracts = risk_dollars / stop_dist if stop_dist > 0 else 0
-        contracts = max(1, round(contracts))
+        contracts = round(contracts)
 
         # Clamp by leverage cap: notional must not exceed equity × lev
         max_contracts = int((equity * lev) / price)
@@ -64,6 +65,10 @@ class RiskManager:
         fraction = self.cfg.get("account_fraction_per_trade", 0.25)
         fraction_contracts = int((equity * fraction * lev) / price)
         contracts = min(contracts, fraction_contracts)
+
+        # R2-5: if clamps reduced to 0, return 0 — "too small to trade"
+        if contracts < 1:
+            return 0, 0
 
         realized_lev = (contracts * price) / max(equity, 1)
         return max(1, contracts), round(min(realized_lev, lev), 2)
@@ -103,14 +108,17 @@ class RiskManager:
         total_dd = (peak - equity) / peak * 100 if peak > 0 else 0
 
         if total_dd >= total_dd_pct:
+            self.state.save()
             return f"Total drawdown {total_dd:.1f}% >= {total_dd_pct}% — manual reset required"
 
         if total_dd >= cb_dd_pct:
+            self.state.save()
             return f"Circuit breaker: total drawdown {total_dd:.1f}% >= {cb_dd_pct}%"
 
         if daily_start > 0:
             daily_dd = (daily_start - equity) / daily_start * 100
             if daily_dd >= daily_dd_pct:
+                self.state.save()
                 return f"Daily drawdown {daily_dd:.1f}% >= {daily_dd_pct}% — paused until tomorrow"
 
         self.state.save()  # persist peak/daily anchor
