@@ -63,15 +63,29 @@ class MeanReversionStrategy(BaseStrategy):
             return Signal("hold", reason="Not enough data")
 
         prices = []
-        for c in candles:
+        null_count = 0
+        for i, c in enumerate(candles):
             try:
-                p = c.get("price", {}).get("close")
-                price_val = float(p) if p is not None else None
-                if price_val is None:
-                    continue
-                prices.append(price_val)
+                pc = c.get("price", {})
+                close = pc.get("close")
+                if close is None:
+                    if i > 0:
+                        prev_close = candles[i - 1].get("price", {}).get("close")
+                        if prev_close is not None:
+                            prices.append(float(prev_close))
+                            null_count += 1
+                            continue
+                    close = pc.get("previous")
+                    if close is None:
+                        null_count += 1
+                        continue
+                prices.append(float(close))
             except (TypeError, ValueError):
+                null_count += 1
                 continue
+
+        if null_count > 0:
+            log.warning("Forward-filled %d null closes in mean reversion", null_count)
         if len(prices) < 50:
             return Signal("hold", reason="Not enough price data")
 
