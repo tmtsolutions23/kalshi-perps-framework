@@ -135,6 +135,15 @@ class PerpsLoop:
             )
             candles = candles_resp.get("candlesticks", [])
 
+            # 4h ATR for stop distances — resample 1h candles into 4h buckets
+            atr_4h = None
+            try:
+                atr_4h = self._compute_resampled_atr(candles, hours=4)
+                if atr_4h > 0:
+                    self.risk.set_atr_4h(atr_4h)
+            except Exception:
+                pass
+
             # PB-EMA regime from daily candles
             try:
                 import time as _time
@@ -168,6 +177,7 @@ class PerpsLoop:
                 "ask": ask,
                 "mark": mark,
                 "candles": candles,
+                "atr_4h": atr_4h,
                 "funding_rate": fund_rate,
                 "next_funding_ts": next_fund_ts,
                 "available_balance": equity,
@@ -237,14 +247,117 @@ class PerpsLoop:
 
         return self.orders.check_stops(price, high_water)
 
+    # ── 4h ATR computation for stop distances ──────────────────────────
+
+    def _compute_resampled_atr(self, candles: list, hours: int = 4, period: int = 14) -> float:
+        """Resample 1h candles into N-hour buckets, compute ATR(period) on them."""
+        # Build contiguous price series first
+        closes, highs, lows = [], [], []
+        for c in candles:
+            try:
+                p = c.get("price", {})
+                h = float(p.get("high", 0))
+                l = float(p.get("low", 0))
+                cl = p.get("close")
+                if cl is None:
+                    continue
+                highs.append(h)
+                lows.append(l)
+                closes.append(float(cl))
+            except (TypeError, ValueError):
+                continue
+
+        if len(closes) < period * hours * 2:
+            return 0.0
+
+        # Bucket into N-hour candles: high = max(highs), low = min(lows), close = last close
+        bucket_h, bucket_l, bucket_c = [], [], []
+        for i in range(0, len(closes) - (len(closes) % hours), hours):
+            chunk_h = highs[i:i+hours]
+            chunk_l = lows[i:i+hours]
+            chunk_c = closes[i:i+hours]
+            if not chunk_c:
+                continue
+            bucket_h.append(max(chunk_h))
+            bucket_l.append(min(chunk_l))
+            bucket_c.append(chunk_c[-1])
+
+        if len(bucket_c) < period + 1:
+            return 0.0
+
+        trs = []
+        for i in range(1, len(bucket_c)):
+            tr = max(
+                bucket_h[i] - bucket_l[i],
+                abs(bucket_h[i] - bucket_c[i-1]),
+                abs(bucket_l[i] - bucket_c[i-1]),
+            )
+            trs.append(tr)
+
+        if len(trs) < period:
+            return 0.0
+        return sum(trs[-period:]) / period
+
+    def _compute_atr(self, candles: list, period: int = 14) -> float:
+        """Compute ATR from candle OHLC data. Returns 0 if insufficient data."""
+        if len(candles) < period + 1:
+            return 0
+        trs = []
+        for i in range(-period, 0):
+            try:
+                pc = candles[i].get("price", {})
+                prev = candles[i - 1].get("price", {})
+                high = float(pc.get("high", 0))
+                low = float(pc.get("low", 0))
+                close = pc.get("close")
+                if close is None:
+                    continue
+                prev_close = prev.get("close")
+                if prev_close is None:
+                    prev_close = prev.get("previous", 0)
+                tr = max(high - low, abs(high - float(prev_close)), abs(low - float(prev_close)))
+                trs.append(tr)
+            except (TypeError, ValueError):
+                continue
+        if len(trs) < period:
+            return 0
+        return sum(trs) / len(trs)
+
+    def _compute_resampled_atr(self, candles: list, hours: int = 4, period: int = 14) -> float:
+        """Resample 1h candles into N-hour buckets and compute ATR."""
+        if len(candles) < period * hours + 1:
+            return 0
+        closes, highs, lows = [], [], []
+        for c in candles:
+            try:
+                p = c.get("price", {})
+                closes.append(float(p.get("close", 0)))
+                highs.append(float(p.get("high", 0)))
+                lows.append(float(p.get("low", 0)))
+            except (TypeError, ValueError):
+                continue
+
+        step = hours
+        h4, l4, c4 = [], [], []
+        for i in range(0, len(highs) - step, step):
+            h4.append(max(highs[i:i+step]))
+            l4.append(min(lows[i:i+step]))
+            c4.append(closes[i+step-1])
+
+        if len(h4) < period + 1:
+            return 0
+
+        trs = []
+        for i in range(1, len(h4)):
+            tr = max(h4[i]-l4[i], abs(h4[i]-c4[i-1]), abs(l4[i]-c4[i-1]))
+            trs.append(tr)
+        return sum(trs[-period:]) / period
+
     # ── PB-EMA trend detection ────────────────────────────────────────────
 
     def _compute_pb_ema_regime(self, daily_candles: list) -> str:
-        """
-        Compute PB-EMA(50) regime from daily candles.
-        Uses blended top line: EMA50(high × 0.7 + close × 0.3) for narrower neutral zone.
-        Returns: 'UP' | 'DOWN' | 'NEUTRAL'
-        """
+        """Compute PB-EMA(50) trend regime from daily candles.
+        Returns: 'UP' | 'DOWN' | 'NEUTRAL'."""
         period = 50
         blend_w = 0.7
 
@@ -521,20 +634,36 @@ class PerpsLoop:
                 live_params=sd.get("live_params", {}),
                 recent_trades=sd.get("recent_trades", []),
                 trend_regime=sd.get("trend_regime", "UNKNOWN"),
+                atr_4h=sd.get("atr_4h"),
             )
 
             # Strategy
             signal = self.strategy.evaluate(ms)
             log.info("Signal: %s (conf=%.2f) — %s", signal.action, signal.confidence, signal.reason)
 
-            # P1-3: Pass ATR from strategy to risk manager for risk-first sizing
-            strategy_atr = getattr(self.strategy, "_cached_atr", None)
-            if strategy_atr and strategy_atr > 0:
-                self.risk.set_atr(strategy_atr)
-            elif atr_fallback := getattr(self.risk, "_last_atr", None):
-                pass  # keep existing
-            else:
-                self.risk.set_atr(price * 0.015)  # final fallback
+            # Override stop/target prices with 4h resampled ATR for meaningful distances
+            atr_4h = sd.get("atr_4h")
+            if atr_4h and atr_4h > 0 and signal.action in ("enter_long", "enter_short"):
+                side = "long" if signal.action == "enter_long" else "short"
+                stops = self.risk.compute_4h_stop_prices(price, side)
+                signal.suggested_stop_loss = stops["stop_loss"]
+                signal.suggested_take_profit = stops["take_profit"]
+                log.info("4h ATR stops: SL=$%.4f TP=$%.4f (ATR=%.4f)", stops["stop_loss"], stops["take_profit"], atr_4h)
+
+            # Kelly sizing update — adapt risk_per_trade_pct as performance accumulates
+            state = self.state.get()
+            last_kelly_cycle = state.get("params", {}).get("_last_kelly_cycle", 0)
+            if state.get("cycle_count", 0) - last_kelly_cycle >= 10:
+                metrics = self._tracker.metrics(price)
+                if metrics.get("total_trades", 0) >= 10:
+                    from core.kelly import compute_from_metrics
+                    kelly_pct = compute_from_metrics(metrics, self.cfg.get("risk", {}))
+                    if kelly_pct is not None:
+                        state["risk_per_trade_pct"] = round(kelly_pct, 4)
+                        state.setdefault("params", {})["_last_kelly_cycle"] = state.get("cycle_count", 0)
+                        self.state.save()
+                        log.info("Kelly update: risk_per_trade=%.2f%% (WR=%.0f%% payoff=%.2f)",
+                                 kelly_pct * 100, metrics.get("win_rate", 0) * 100, metrics.get("payoff_ratio", 0))
 
             if signal.action in ("enter_long", "enter_short"):
                 self.alerts.signal(f"{signal.action.replace('enter_', '').upper()} signal (conf={signal.confidence:.0%}) — {signal.reason}")

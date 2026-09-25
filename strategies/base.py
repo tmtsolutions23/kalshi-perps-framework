@@ -63,6 +63,9 @@ class MarketSnapshot:
     # PB-EMA trend regime (set by main.py from daily candles)
     trend_regime: str = 'UNKNOWN'  # 'UP' | 'DOWN' | 'NEUTRAL'
 
+    # 4h ATR (resampled from 1h by main.py) for wider stop placement
+    atr_4h: Optional[float] = None
+
 
 class BaseStrategy(ABC):
     """Override evaluate() to generate signals. Access live_params from snapshot."""

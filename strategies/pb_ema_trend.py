@@ -120,8 +120,10 @@ class PBEMATrendStrategy(BaseStrategy):
         if fast_ema is None:
             return Signal("hold", reason="EMA computation failed")
 
-        # ATR with cache fallback
-        atr = self._compute_atr(candles, atr_period)
+        # ATR with cache fallback — prefer 4h ATR (wider stops, fewer noise stops)
+        atr = snapshot.atr_4h
+        if atr is None or atr == 0:
+            atr = self._compute_atr(candles, atr_period)  # fall back to 1h
         if atr is None or atr == 0:
             if self._cached_atr:
                 atr = self._cached_atr

@@ -14,7 +14,7 @@ strategy:
     fast_ema_period: 12
     atr_period: 14
     atr_multiplier_sl: 1.5           # stop loss = ATR × this
-    atr_multiplier_tp: 2.0           # take profit = ATR × this (asymmetric: 2:1.5)
+    atr_multiplier_tp: 3.0           # take profit = ATR × this (wider: 3:1.5 for growth)
     pullback_threshold: 0.3          # pullback entry: within pullback×ATR of fast EMA
     breakout_threshold: 0.4          # breakout entry: price accelerating past EMA by ≥0.4 ATR
     breakout_min_runup_atr: 0.5      # minimum prior EMA distance for breakout detection
@@ -22,10 +22,13 @@ strategy:
 
 risk:
   initial_equity: 500               # paper trading starting balance
-  max_leverage: 4.0
+  max_leverage: 6.0                 # Kalshi BTC cap is ~6.4x — raise as account grows
   min_leverage: 2.0
   account_fraction_per_trade: 0.25
-  risk_per_trade_pct: 0.01           # 1% of equity per trade (risk-first sizing)
+  risk_per_trade_pct: 0.03          # base risk per trade (before Kelly overrides)
+  kelly_fraction: 0.25              # quarter Kelly — grows sizing with proven win rate
+  min_risk_pct: 0.02                # floor: never risk less than 2%
+  max_risk_pct: 0.08                # ceiling: never risk more than 8%
   max_daily_drawdown_pct: 10.0
   max_total_drawdown_pct: 25.0
   circuit_breaker_drawdown_pct: 15.0
