@@ -60,6 +60,9 @@ class MarketSnapshot:
     # Trade history for performance tracking
     recent_trades: list = field(default_factory=list)
 
+    # PB-EMA trend regime (set by main.py from daily candles)
+    trend_regime: str = 'UNKNOWN'  # 'UP' | 'DOWN' | 'NEUTRAL'
+
 
 class BaseStrategy(ABC):
     """Override evaluate() to generate signals. Access live_params from snapshot."""

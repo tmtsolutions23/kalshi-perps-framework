@@ -126,6 +126,17 @@ class PerpsLoop:
             )
             candles = candles_resp.get("candlesticks", [])
 
+            # PB-EMA regime from daily candles
+            try:
+                import time as _time
+                c1d = self._safe_api_call(
+                    self.market.get_candlesticks, self.ticker, period_minutes=1440,
+                    limit=100, start_ts=int(_time.time()) - 120 * 86400,
+                )
+                trend_regime = self._compute_pb_ema_regime(c1d.get("candlesticks", []))
+            except Exception:
+                trend_regime = "UNKNOWN"
+
             try:
                 fund = self._safe_api_call(self.market.get_funding_rate_estimate, self.ticker)
                 fund_rate = fund.get("funding_rate")
@@ -155,6 +166,7 @@ class PerpsLoop:
                 "leverage_estimate": lev_est,
                 "recent_trades": recent_trades,
                 "live_params": live_params,
+                "trend_regime": trend_regime,
             }
         except Exception as e:
             log.error("Failed to fetch snapshot: %s", e)
@@ -215,6 +227,56 @@ class PerpsLoop:
             high_water = min(snapshot.get("price", 0), pos.get("entry_price", 0))
 
         return self.orders.check_stops(price, high_water)
+
+    # ── PB-EMA trend detection ────────────────────────────────────────────
+
+    def _compute_pb_ema_regime(self, daily_candles: list) -> str:
+        """
+        Compute PB-EMA(50) regime from daily candles.
+        Uses blended top line: EMA50(high × 0.7 + close × 0.3) for narrower neutral zone.
+        Returns: 'UP' | 'DOWN' | 'NEUTRAL'
+        """
+        import math as _math
+        period = 50
+        blend_w = 0.7  # R2-15: blend weight for PB-EMA top line
+
+        if len(daily_candles) < period:
+            return "UNKNOWN"
+
+        highs, closes = [], []
+        for c in daily_candles:
+            try:
+                p = c.get("price", {})
+                highs.append(float(p.get("high", 0)))
+                closes.append(float(p.get("close", 0)))
+            except (TypeError, ValueError):
+                continue
+
+        if len(highs) < period:
+            return "UNKNOWN"
+
+        # Compute EMAs
+        def _ema(values):
+            k = 2 / (period + 1)
+            e = values[0]
+            for v in values[1:]:
+                e = v * k + e * (1 - k)
+            return e
+
+        close_slice = closes[-period:]
+        blended = [highs[-(period - i)] * blend_w + closes[-(period - i)] * (1 - blend_w)
+                   for i in range(period)]
+
+        ema_top = _ema(blended)
+        ema_bot = _ema(close_slice)
+        last_close = closes[-1]
+
+        if last_close > ema_top:
+            return "UP"
+        elif last_close < ema_bot:
+            return "DOWN"
+        else:
+            return "NEUTRAL"
 
     # ── Adaptation ───────────────────────────────────────────────────────
 
@@ -450,6 +512,7 @@ class PerpsLoop:
                 current_leverage_estimate=sd.get("leverage_estimate"),
                 live_params=sd.get("live_params", {}),
                 recent_trades=sd.get("recent_trades", []),
+                trend_regime=sd.get("trend_regime", "UNKNOWN"),
             )
 
             # Strategy

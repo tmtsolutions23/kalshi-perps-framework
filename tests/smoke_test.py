@@ -14,6 +14,7 @@ from core.orders import PaperOrderManager
 from strategies.base import MarketSnapshot
 from strategies.funding_momentum import FundingMomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
+from strategies.pb_ema_trend import PBEMATrendStrategy
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG = yaml.safe_load(open(os.path.join(BASE, "config.yaml")))
@@ -155,7 +156,36 @@ def main():
     print(f"  suggested_stop_loss={sig2.suggested_stop_loss:.4f} (entry {spike[-1]:.4f})")
     assert abs(sig2.suggested_stop_loss - spike[-1]) > 0  # stop is not at entry
 
-    print("\n✅ ALL SMOKE TESTS PASSED — P0 + P1 fixes verified")
+    # 11. PB-EMA trend strategy with regime filter
+    print("== 11. PB-EMA trend strategy ==")
+    pb = PBEMATrendStrategy({})
+    prices_up = [8.0 + i * 0.002 for i in range(200)]
+    snap_pb = MarketSnapshot(
+        ticker="KXBTCPERP", current_price=prices_up[-1],
+        bid=prices_up[-1]-0.0001, ask=prices_up[-1]+0.0001, mark_price=prices_up[-1],
+        candles_1h=make_candles(prices_up),
+        funding_rate=0.0, available_balance=10000.0, current_position=None,
+        current_leverage_estimate=4.0, live_params={}, recent_trades=[],
+        trend_regime="UP",
+    )
+    sig_pb = pb.evaluate(snap_pb)
+    print(f"  UP regime signal: {sig_pb.action} — {sig_pb.reason}")
+    assert sig_pb.action in ("enter_long", "hold"), f"expected long or hold, got {sig_pb.action}"
+
+    # PB-EMA NEUTRAL should hold
+    snap_pb_n = MarketSnapshot(
+        ticker="KXBTCPERP", current_price=prices_up[-1],
+        bid=prices_up[-1]-0.0001, ask=prices_up[-1]+0.0001, mark_price=prices_up[-1],
+        candles_1h=make_candles(prices_up),
+        funding_rate=0.0, available_balance=10000.0, current_position=None,
+        current_leverage_estimate=4.0, live_params={}, recent_trades=[],
+        trend_regime="NEUTRAL",
+    )
+    sig_pb_n = pb.evaluate(snap_pb_n)
+    print(f"  NEUTRAL regime signal: {sig_pb_n.action} — {sig_pb_n.reason}")
+    assert sig_pb_n.action == "hold", f"expected hold in neutral, got {sig_pb_n.action}"
+
+    print("\n✅ ALL SMOKE TESTS PASSED — P0 + P1 + PB-EMA verified")
 
 
 if __name__ == "__main__":

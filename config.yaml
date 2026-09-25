@@ -9,16 +9,16 @@ market:
   ticker: KXBTCPERP                 # BTC perp ticker
 
 strategy:
-  name: funding_momentum             # which strategy module to load
+  name: pb_ema_trend                # pb_ema_trend | funding_momentum | mean_reversion
   params:
     fast_ema_period: 12
-    slow_ema_period: 48
-    min_funding_bias: 0.0001
     atr_period: 14
     atr_multiplier_sl: 1.5           # stop loss = ATR × this
     atr_multiplier_tp: 2.0           # take profit = ATR × this (asymmetric: 2:1.5)
     pullback_threshold: 0.3          # pullback entry: within pullback×ATR of fast EMA
-    max_position_hours: 168          # force close if held longer
+    breakout_threshold: 0.4          # breakout entry: price accelerating past EMA by ≥0.4 ATR
+    breakout_min_runup_atr: 0.5      # minimum prior EMA distance for breakout detection
+    max_position_hours: 168
 
 risk:
   max_leverage: 4.0
