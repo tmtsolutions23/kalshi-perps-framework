@@ -21,6 +21,7 @@ strategy:
     max_position_hours: 168
 
 risk:
+  initial_equity: 500               # paper trading starting balance
   max_leverage: 4.0
   min_leverage: 2.0
   account_fraction_per_trade: 0.25

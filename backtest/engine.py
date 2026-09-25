@@ -18,7 +18,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-SEED_EQUITY = 10000.0
+SEED_EQUITY = 500.0  # overridden by config.initial_equity at runtime
 
 
 class PerformanceTracker:

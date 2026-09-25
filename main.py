@@ -81,6 +81,15 @@ class PerpsLoop:
         self._btc_start_recorded = False
         self._last_metrics_print = None
 
+        # Seed paper equity from config if not yet set
+        state = self.state.get()
+        if state.get("equity") is None or state.get("cycle_count", 0) == 0:
+            initial = self.cfg.get("risk", {}).get("initial_equity", 500)
+            state["equity"] = float(initial)
+            state["peak_equity"] = float(initial)
+            state["daily_start_equity"] = float(initial)
+            self.state.save()
+
     # ── Self-healing ─────────────────────────────────────────────────────
 
     def _safe_api_call(self, fn, *args, retries=3, **kwargs):
