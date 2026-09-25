@@ -74,7 +74,7 @@ def main():
     print("== 3. Risk sizing ==")
     risk = RiskManager(CFG, state)
     risk._snapshot_price = prices[-1]
-    risk.set_atr(0.05)  # typical for contract price ~8
+    risk.set_atr_4h(0.05)  # typical for contract price ~8
     count, lev = risk.compute_position_size(sig.suggested_leverage or 4.0)
     print(f"  equity=$10,000 @ {lev}x → {count} contracts")
     assert count > 0 and lev <= 4.0

@@ -323,35 +323,6 @@ class PerpsLoop:
             return 0
         return sum(trs) / len(trs)
 
-    def _compute_resampled_atr(self, candles: list, hours: int = 4, period: int = 14) -> float:
-        """Resample 1h candles into N-hour buckets and compute ATR."""
-        if len(candles) < period * hours + 1:
-            return 0
-        closes, highs, lows = [], [], []
-        for c in candles:
-            try:
-                p = c.get("price", {})
-                closes.append(float(p.get("close", 0)))
-                highs.append(float(p.get("high", 0)))
-                lows.append(float(p.get("low", 0)))
-            except (TypeError, ValueError):
-                continue
-
-        step = hours
-        h4, l4, c4 = [], [], []
-        for i in range(0, len(highs) - step, step):
-            h4.append(max(highs[i:i+step]))
-            l4.append(min(lows[i:i+step]))
-            c4.append(closes[i+step-1])
-
-        if len(h4) < period + 1:
-            return 0
-
-        trs = []
-        for i in range(1, len(h4)):
-            tr = max(h4[i]-l4[i], abs(h4[i]-c4[i-1]), abs(l4[i]-c4[i-1]))
-            trs.append(tr)
-        return sum(trs[-period:]) / period
 
     # ── PB-EMA trend detection ────────────────────────────────────────────
 
