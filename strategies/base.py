@@ -23,6 +23,8 @@ class Signal:
     suggested_leverage: Optional[float] = None
     suggested_stop_loss: Optional[float] = None
     suggested_take_profit: Optional[float] = None
+    suggested_trailing_bps: Optional[int] = None
+    suggested_trailing_activate: Optional[float] = None
 
 
 @dataclass

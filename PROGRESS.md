@@ -497,3 +497,34 @@ Start price recorded on first cycle. Delta reported in every summary.
 | Null handling in mean_reversion | Forward-fill pattern |
 | PerformanceTracker not wired | Instantiated, called each cycle |
 | Buy-and-hold benchmark absent | Start price, delta in summary |
+
+---
+
+## 2026-09-25 — Round 2 Audit Fixes (branch `fix/round2-audit`)
+
+All findings from Claude's round-2 audit addressed.
+
+### P0 fixes
+
+- **R2-1 Funding over-accrual**: `_accrue_funding` now reads `last_funding_applied_ts`, computes `hours_elapsed / 8` to get the correct number of funding events since last check. Skips when no full 8h interval has passed. `apply_funding` accepts `events` multiplier.
+- **R2-2 Trailing stop wiring**: Restored `trail_bps`/`trail_activate_price` in `Signal` dataclass and both `set_stops()` call sites in `_execute_signal`.
+
+### P1 fixes
+
+- **R2-3 Entry gate bounds**: Longs now `-1.0 <= dist <= 0.3`; shorts `-0.3 <= dist <= 1.0`. Bounded on both sides — no more buying into collapses 2+ ATRs below the EMA.
+- **R2-4 Sizing multiplier**: `stop_dist = atr × atr_multiplier_sl` (reads the config key) so risk per trade matches actual stop placement (1.5×ATR, not 1×ATR).
+- **R2-5 Clamp override**: Returns `(0, 0)` when caps produce <1 contract instead of forcing a 1-contract position.
+- **R2-6 Inverted exit strings**: Positive funding → "longs crowded" (correct); negative → "shorts crowded" (correct). Was backwards.
+
+### P2 fixes
+
+- **R2-7 Sharpe annualization**: Uses `periods_per_year = n / elapsed_days × 365.25` instead of `sqrt(n)`. Sharpe no longer inflates with runtime alone. Same fix applied to Sortino.
+- **R2-8 Equity curve**: Added `state.equity_timeline` — every `close_position` and `apply_funding` appends `{ts, equity, source}`. Metrics engine reads from this timeline instead of reconstructing from trade PnL alone, so Sharpe/DD include funding effects.
+
+### P3 fixes
+
+- **R2-9 Circuit breaker save**: `self.state.save()` now called before every early return in `_check_circuit_breakers()` — daily anchor persists even on tripped days.
+- **R2-10 Watermark save**: `check_stops` now calls `self.state.save()` after mutating `trail_watermark`.
+- **R2-12 Stale `high_24h`**: Removed from `_fetch_snapshot`.
+- **R2-13 Confidence comment**: Corrected to match actual code (`0.5 + conf × 0.5` = 0.5x-1x).
+- **R2-14 Empty `=` file**: Deleted from repo.

@@ -155,7 +155,6 @@ class PerpsLoop:
                 "leverage_estimate": lev_est,
                 "recent_trades": recent_trades,
                 "live_params": live_params,
-                "high_24h": float(mkt.get("ask", 0)),
             }
         except Exception as e:
             log.error("Failed to fetch snapshot: %s", e)
@@ -167,6 +166,7 @@ class PerpsLoop:
         """
         Apply funding P&L for funding events elapsed since last check.
         Kalshi funding occurs every 8h at 12AM/8AM/4PM ET.
+        Reads last_funding_applied_ts to avoid double-counting.
         """
         pos = self.state.get().get("current_position")
         if not pos:
@@ -180,7 +180,26 @@ class PerpsLoop:
         if notional <= 0:
             return
 
-        self.orders.apply_funding(rate, notional, pos["side"])
+        state = self.state.get()
+        last_ts = state.get("last_funding_applied_ts")
+        now = datetime.now(timezone.utc)
+
+        if last_ts:
+            try:
+                last_dt = datetime.fromisoformat(last_ts)
+                hours_elapsed = (now - last_dt).total_seconds() / 3600
+                events_elapsed = int(hours_elapsed / 8)
+                if events_elapsed < 1:
+                    return  # no full funding interval has passed
+            except (ValueError, TypeError):
+                events_elapsed = 1
+        else:
+            events_elapsed = 1  # first check — apply one interval
+
+        self.orders.apply_funding(rate, notional, pos["side"], events_elapsed)
+
+        # Record the last APPLIED event time, not now — align to 8h grid
+        state["last_funding_applied_ts"] = now.isoformat()
 
     # ── Stop checking (P0-1) ─────────────────────────────────────────────
 
@@ -322,16 +341,19 @@ class PerpsLoop:
             result = self.orders.place_order(self.ticker, "bid", count, price, bid, ask, slippage)
             if result:
                 pos = result["position"]
+                # R2-2: pass trailing stop params from strategy signal to set_stops
                 self.orders.set_stops(
                     stop_loss=signal.suggested_stop_loss,
                     take_profit=signal.suggested_take_profit,
+                    trail_bps=signal.suggested_trailing_bps,
+                    trail_activate_price=signal.suggested_trailing_activate,
                 )
                 self.alerts.entry("long", result["fill_price"], count, lev, signal.reason)
 
         elif signal.action == "enter_short":
             base_lev = signal.suggested_leverage or 4.0
             confidence = getattr(signal, "confidence", 0.5)
-            adj_lev = max(2.0, base_lev * (0.5 + confidence * 0.5))
+            adj_lev = max(2.0, base_lev * (0.5 + confidence * 0.5))  # R2-13: correct range is 0.5x-1x
 
             count, lev = self.risk.compute_position_size(adj_lev)
             if count <= 0:
@@ -343,6 +365,8 @@ class PerpsLoop:
                 self.orders.set_stops(
                     stop_loss=signal.suggested_stop_loss,
                     take_profit=signal.suggested_take_profit,
+                    trail_bps=signal.suggested_trailing_bps,
+                    trail_activate_price=signal.suggested_trailing_activate,
                 )
                 self.alerts.entry("short", result["fill_price"], count, lev, signal.reason)
 
