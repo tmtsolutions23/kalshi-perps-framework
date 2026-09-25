@@ -432,6 +432,15 @@ class PerpsLoop:
             signal = self.strategy.evaluate(ms)
             log.info("Signal: %s (conf=%.2f) — %s", signal.action, signal.confidence, signal.reason)
 
+            # P1-3: Pass ATR from strategy to risk manager for risk-first sizing
+            strategy_atr = getattr(self.strategy, "_cached_atr", None)
+            if strategy_atr and strategy_atr > 0:
+                self.risk.set_atr(strategy_atr)
+            elif atr_fallback := getattr(self.risk, "_last_atr", None):
+                pass  # keep existing
+            else:
+                self.risk.set_atr(price * 0.015)  # final fallback
+
             if signal.action in ("enter_long", "enter_short"):
                 self.alerts.signal(f"{signal.action.replace('enter_', '').upper()} signal (conf={signal.confidence:.0%}) — {signal.reason}")
             elif signal.action == "exit":

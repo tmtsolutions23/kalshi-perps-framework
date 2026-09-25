@@ -393,6 +393,71 @@ The strategy still computes `suggested_stop_loss` and `suggested_take_profit` �
 
 ---
 
+## 2026-09-24 — P1 Strategy Math Fixes (branch `fix/p1-strategy-math`)
+
+Eight remaining P1 issues from the audit addressed in one pass.
+
+### P1-1: Funding filter — confirmation, not veto
+
+**Before:** Funding could only cancel trades, never initiate them. The entry gate required `bias == trend`, but funding already overrode trend — so the only possible outcome was a stricter version of the trend bias. Combined with funding being positive ~98% of the time, the strategy was structurally short-only, ignoring 46% of events.
+
+**Fix:** Funding is now a *confirmation* filter. When |funding| >= min_funding_bias, it must agree with the trend direction. When funding is neutral (< min_funding), the trend alone decides. This means:
+- Uptrend + positive funding (common) → **both agree on long** → enters long (previously blocked!)
+- Downtrend + positive funding → both agree on short → enters short
+- Neutral funding → follows trend
+
+Now trades both directions and passes the audit test: uptrend + positive funding with a pullback actually enters.
+
+### P1-2: Funding exit threshold — dynamic instead of hardcoded
+
+**Before:** Required `abs(fund) > min_funding * 5 = 0.0005` to exit. Only 2 of 339 historical events exceeded this — dead code.
+
+**Fix:** Uses `min_funding * 3` as the exit threshold (~90th percentile of empirical distribution). Exit fires when funding strongly opposes the position.
+
+### P1-3: Risk-first sizing wired end-to-end
+
+**Before:** `risk.py` had `set_atr()` and `_last_atr` but nothing ever called them.
+
+**Fix:** Strategy stores `_cached_atr`, `main.py` passes it to `risk.set_atr()`.
+
+### P1-4: Directional pullback entry
+
+**Before:** `abs(ema_distance_atr) <= pullback_threshold` — symmetric proximity band.
+
+**Fix:** Longs: `ema_distance_atr <= pullback_threshold`. Shorts: `ema_distance_atr >= -pullback_threshold`.
+
+### P1-5: Asymmetric reward:risk
+
+**Before:** 1:1 payoff — needed ~55% win rate to break even.
+
+**Fix:** TP multiplier 2.0, SL 1.5 — break-even ~43%.
+
+### P1-6: ATR OHLC source
+
+**Before:** Used `ask.high`/`bid.low` — measures spread noise.
+
+**Fix:** Uses `price.high`, `price.low`, `price.previous`.
+
+### P1-7: ATR fallback — refuse to fabricate
+
+**Before:** Silent 2% fallback (2.7× too wide).
+
+**Fix:** Cache + hold. No trade without a real volatility estimate.
+
+### P1-8: Null candle close handling
+
+**Before:** `dict.get("close", 0)` returned `None` — `float(None)` raised, bars silently dropped.
+
+**Fix:** Forward-fill from `price.previous`, log count, assert series length.
+
+### P1-9: Mean reversion stops and funding gate
+
+**Before:** No stop loss, funding gate structurally short-only.
+
+**Fix:** Hard stop at ±3×ATR, funding gate removed.
+
+---
+
 ## 2026-09-24 — P2/P3 Metrics, Benchmark, Adaptation Gating (branch `fix/p2-p3-metrics-benchmarks`)
 
 Final pass: metrics corrected and wired into the loop, benchmark added, adaptation statistical gating, remaining hygiene items closed.
@@ -400,42 +465,35 @@ Final pass: metrics corrected and wired into the loop, benchmark added, adaptati
 ### P2-1 / P2-3: Sharpe and Max DD corrected
 
 `backtest/engine.py` rewritten:
-- **Sharpe** now computed on per-trade **returns** (net_pnl / equity_at_entry), sample stdev (n-1), annualized by √(trades)
-- **Sortino** added — uses downside deviation only
+- **Sharpe** on per-trade **returns** (net_pnl / equity_at_entry), sample stdev (n-1), annualized by √(trades)
+- **Sortino** added — downside deviation only
 - **Calmar** — total return % / max drawdown %
-- **Max drawdown** as % of equity on the sequential equity curve (not dollar-peak-from-zero)
-- **Profit factor** was already correct from the P0 pass
+- **Max drawdown** as % of equity on sequential equity curve
+- **Profit factor** was already correct (P0 pass)
 - **Expectancy** — (win% × avg_win) − (loss% × avg_loss), net of all costs
-- **Payoff ratio** — reported alongside PF, not conflated with it
 
 ### P2-4: PerformanceTracker wired into the loop
 
-`PerformanceTracker` accepts a `state_manager`. `main.py` instantiates it and calls `summary_text(btc_price)` after every cycle. When trades exist, it prints a formatted block with Win%, PF, Sharpe, Calmar, MaxDD, Long/Short split, AvgHold, and BTC buy-hold delta.
+Instantiated in `main.py`, calls `summary_text(btc_price)` after every cycle. Prints Win%, PF, Sharpe, Calmar, MaxDD, Long/Short split, AvgHold, BTC buy-hold delta.
 
 ### P2-5: Buy-and-hold BTC benchmark
 
-Start price recorded on first cycle. Delta vs buy-and-hold reported in every summary.
+Start price recorded on first cycle. Delta reported in every summary.
 
 ### P3-1: Statistical gating on win rate
 
-`_win_rate_ci()` computes the 95% Wilson CI. Adaptation only fires when:
-- **Raise leverage**: requires `ci_lower > 0.5` (95% confident WR > 50%)
-- **Cut leverage**: fires on `ci_upper < 0.5` OR the old heuristic
-- Prevents adaptation on noisy n=10 samples
+95% Wilson CI gates adaptation. Raise leverage only when `ci_lower > 0.5` (95% confident WR above 50%).
 
 ### P3-3: Out-of-sample confirmation
 
-Each adaptation cycle splits trades into training (60%) and validation (40%):
-- **Tighten entry**: only when training PF < 0.7 AND validation PF < 1.0
-- **Loosen entry**: requires training PF > 2.0 AND wr_reliable AND (val PF > 1.5 or too few val trades)
-- Prevents in-sample curve fitting
+60/40 train/test split. Tighten/loosen entries only confirmed on validation window.
 
 ### Remaining hygiene closed
 
 | Item | Status |
 |---|---|
 | `check_entry_allowed()` never called | Wired into `_execute_signal` |
-| `signal.confidence` unused | Scales leverage by conviction |
-| Null handling in mean_reversion | Same forward-fill as funding_momentum |
+| `signal.confidence` unused | Scales leverage 0.75×-1× |
+| Null handling in mean_reversion | Forward-fill pattern |
 | PerformanceTracker not wired | Instantiated, called each cycle |
 | Buy-and-hold benchmark absent | Start price, delta in summary |

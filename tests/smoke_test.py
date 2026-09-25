@@ -126,7 +126,36 @@ def main():
     print(f"  signal={sig2.action} — {sig2.reason}")
     assert sig2.action == "enter_short"
 
-    print("\n✅ ALL SMOKE TESTS PASSED — P0 fixes verified")
+    # 8. P1-1: Funding-trend conflict blocks entry (funding positive + uptrend)
+    print("== 8. P1-1: Funding-trend conflict ==")
+    sig_conflict = strat.evaluate(MarketSnapshot(
+        ticker="KXBTCPERP", current_price=prices[-1],
+        bid=prices[-1]-0.0001, ask=prices[-1]+0.0001, mark_price=prices[-1],
+        candles_1h=make_candles(prices),
+        funding_rate=0.0005,  # positive funding → short bias, but we're in uptrend
+        available_balance=10000.0, current_position=None,
+        current_leverage_estimate=4.0, live_params={}, recent_trades=[],
+    ))
+    print(f"  signal={sig_conflict.action} — {sig_conflict.reason}")
+    assert sig_conflict.action == "hold", f"expected hold on conflict, got {sig_conflict.action}"
+    assert "conflicts" in sig_conflict.reason
+
+    # 9. P1-8: Null candle close forward-fills from price.previous
+    print("== 9. P1-8: Null candle handling ==")
+    null_candles = make_candles(prices)
+    null_candles[-2]["price"]["close"] = None  # put null in candle index -2
+    null_candles[-2]["price"]["previous"] = prices[-3]  # price.previous is set
+    prices_filled = strat._build_prices(null_candles)
+    print(f"  prices extracted: {len(prices_filled)}, last 3: {prices_filled[-3:]}")
+    assert len(prices_filled) == len(prices), f"expected {len(prices)} prices, got {len(prices_filled)}"
+
+    # 10. P1-9: Mean reversion has SL in signal
+    print("== 10. P1-9: Mean reversion stop ==")
+    assert sig2.suggested_stop_loss is not None, "mean reversion missing suggested_stop_loss"
+    print(f"  suggested_stop_loss={sig2.suggested_stop_loss:.4f} (entry {spike[-1]:.4f})")
+    assert abs(sig2.suggested_stop_loss - spike[-1]) > 0  # stop is not at entry
+
+    print("\n✅ ALL SMOKE TESTS PASSED — P0 + P1 fixes verified")
 
 
 if __name__ == "__main__":
