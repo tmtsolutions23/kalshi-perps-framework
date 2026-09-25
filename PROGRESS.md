@@ -1,7 +1,7 @@
 # Project Progress — Kalshi BTC Perps Trading Framework
 
 **Repo:** `github.com/tmtsolutions23/kalshi-perps-framework`
-**Status:** Phase 1 — Paper trading, live data, self-healing loop running via cron
+**Status:** All P0-P4 audit findings fixed. Running on main via cron (every 4h, paper mode, zero LLM tokens).
 
 ---
 
