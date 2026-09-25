@@ -1,7 +1,9 @@
 # Project Progress — Kalshi BTC Perps Trading Framework
 
 **Repo:** `github.com/tmtsolutions23/kalshi-perps-framework`
-**Status:** All P0-P4 audit findings fixed. Running on main via cron (every 4h, paper mode, zero LLM tokens).
+**Status:** Round-1 audit findings largely fixed; **round-2 audit (2026-09-24) found 2 P0s
+still open** — funding over-accrues ~2×, and the trailing stop remains unwired. Paper
+results are not yet trustworthy. See "Audit Round 2" below.
 
 ---
 
@@ -497,3 +499,185 @@ Start price recorded on first cycle. Delta reported in every summary.
 | Null handling in mean_reversion | Forward-fill pattern |
 | PerformanceTracker not wired | Instantiated, called each cycle |
 | Buy-and-hold benchmark absent | Start price, delta in summary |
+
+---
+
+## Audit Round 2 — 2026-09-24
+
+Re-audit of commits `6011e8f`, `0cd9540`, `a7086b3`, `47400e7`. Verified against live
+`KXBTCPERP` data (198 hourly candles, 339 funding events / 113 days) and by executing the
+metrics engine directly. **Two P0s remain open**, and one round-1 fix regressed.
+
+The round-1 status line claimed "all P0–P4 findings fixed." Two of them are not, and both
+are the same failure mode as the original audit: **code that exists but is never reached.**
+Before closing a finding, grep for the caller — implementing a function is not wiring it.
+
+### Verified fixed (do not regress these)
+
+| Finding | Evidence |
+|---|---|
+| P0-2 equity tracking | `state["equity"]` updated in `orders.close_position:163`; breakers read it; UTC daily rollover at `risk.py:87-93` |
+| P0-4 fills | Long fills `ask×(1+slip)`, short `bid×(1−slip)` (`orders.py:41,46`); entry **and** exit fees both in `net_pnl:159` |
+| P1-3 risk-first sizing | `contracts = (equity × risk_pct) / stop_dist` (`risk.py:48-55`) |
+| P1-5 asymmetric R:R | TP 2.0 × ATR vs SL 1.5 × ATR |
+| P1-6 ATR source | Now `price.high/low/previous`, no bid/ask mixing |
+| P1-8 null candles | Forward-fill + `log.warning` on count |
+| P2-2 profit factor | True `Σwins/Σlosses`; `payoff_ratio` separated — verified correct by execution |
+| P2-3 / P2-5 | Max DD as % of equity curve; buy-and-hold benchmark recorded and reported |
+| P3-1 / P3-3 | Wilson CI gate, 5-cycle cooldown, asymmetric leverage (−0.5 down / +0.25 up), 60/40 OOS split |
+| P4 hygiene | Dead config keys deleted; `check_entry_allowed()` wired; confidence scales size |
+
+### P0 — still open
+
+**R2-1. Funding over-accrues ~2x, and the guard field is dead wiring.**
+`main.py:398` calls `_accrue_funding(sd)` once per cycle, and `_accrue_funding:183` applies
+the **full** rate unconditionally. Funding on this market is charged **every 8h (3x/day,
+verified over 113 days)**; the loop runs every 4h (6x/day). `orders.apply_funding:197`
+writes `state["last_funding_applied_ts"]` and **nothing ever reads it** — grep confirms
+zero readers. `next_funding_ts` is fetched and threaded into the snapshot, also unused.
+The docstring claims "for funding events elapsed since last check," which the code does not do.
+
+Magnitude: at 1x equity notional and rate 0.0001, correct accrual is $3/day on $10k; actual
+is $6/day. Because the strategy is structurally short-biased and shorts *receive* positive
+funding, this **inflates** paper P&L by roughly 0.9% of equity per month of continuous
+holding — the dangerous direction.
+
+Fix: compute elapsed funding events from `last_funding_applied_ts` (or `next_funding_ts`)
+and apply `rate × notional × events_elapsed`, then set the marker to the **event
+timestamp**, not `now()`. Return 0 and skip when no event has passed.
+
+**R2-2. The trailing stop is still unreachable — same dead-wiring bug as round 1.**
+`orders.set_stops()` accepts `trail_bps`/`trail_activate_price`, and `check_stops:129-143`
+implements the ratchet. But both call sites (`main.py:325`, `main.py:343`) pass **only**
+`stop_loss` and `take_profit`. `pos["trail_bps"]` is therefore always `None`, and the entire
+trailing block is unreachable in production. The `trailing_activate_pct` / `trailing_bps`
+config keys were **deleted** from `config.yaml` rather than wired up, so nothing can ever
+populate them. The only code that exercises the path is `tests/smoke_test.py:91`, which sets
+stops manually — giving false confidence that the feature works.
+
+Fix: restore both config keys and pass them at both `set_stops` call sites —
+`trail_bps=cfg.trailing_bps`, `trail_activate_price = entry × (1 ± trailing_activate_pct/100)`
+by side. Then re-check the short-side activation branch (`orders.py:139`), which has never
+executed.
+
+### P1 — regression introduced in round 1 fixes
+
+**R2-3. The "directional pullback" fix made the entry gate 2.5x more permissive and
+removed the lower bound entirely.**
+`funding_momentum.py:203` (long) tests `ema_distance_atr <= pullback_threshold` and `:224`
+(short) tests `>= -pullback_threshold`. Both are **one-sided and unbounded**. A long now
+fires when price is *arbitrarily far below* the EMA — buying into a collapse — which is the
+opposite of a pullback entry.
+
+Measured on 137 evaluable bars of live data:
+
+| Gate | Fires on |
+|---|---|
+| Old `abs(dist) <= 0.3` | 21.9% of bars |
+| New long `dist <= 0.3` | **54.0%** of bars (2.5x more permissive) |
+| New short `dist >= -0.3` | **67.9%** of bars |
+| New long firing >1 ATR *below* the EMA | 10.9% of bars |
+
+Fix: make it a band, not a half-line — long requires `-1.0 <= dist <= 0.3`, short requires
+`-0.3 <= dist <= 1.0` (tune the outer bound). The old `abs()` was wrong about direction but
+at least bounded; this is strictly worse tail behavior.
+
+**R2-4. Position sizing understates risk by the SL multiplier — actual risk is 1.5%, not 1%.**
+`risk.py:51` uses `stop_dist = self._last_atr` (1 x ATR), but the stop is placed at
+`atr × atr_multiplier_sl` = **1.5 x ATR** (`funding_momentum.py:205`). Risk per trade is
+therefore 1.5 x `risk_per_trade_pct`.
+
+Fix: `stop_dist = atr × atr_multiplier_sl`, reading the multiplier from config so the two
+stay coupled.
+
+**R2-5. `max(1, contracts)` at `risk.py:69` overrides the leverage and fraction caps.**
+If either clamp computes to 0, a 1-contract position is forced anyway.
+Fix: return `(0, 0)` when the clamps produce 0 — "too small to trade" is a valid answer.
+
+**R2-6. Funding-exit rule is still near-dead, and its reason strings are inverted.**
+Threshold `min_funding × 3` = 0.0003 fires on **5 of 339 events (1.5%)** over 113 days —
+better than round 1's 0.6%, still effectively dead. Separately, `funding_momentum.py:266`
+prints "shorts crowded" when funding is **positive**; positive funding means longs pay
+shorts, i.e. *longs* are crowded. Both messages are backwards, and they go into the Discord
+alerts a human reads.
+
+Fix: derive the threshold from a trailing percentile of observed absolute funding, and
+correct the two strings.
+
+### P2 — metrics
+
+**R2-7. Sharpe is annualized by sqrt(total trades), so it inflates the longer you run.**
+`backtest/engine.py:81`: `sharpe = (mean_r / stdev) * sqrt(n)` where `n` is the cumulative
+trade count. Annualization requires trades **per year**, not trades observed. Verified by
+executing the tracker with an identical per-trade distribution:
+
+```
+n= 10  sharpe=0.348   PF=1.25  maxDD=0.79%
+n= 20  sharpe=0.506   PF=1.25  maxDD=0.79%
+n= 40  sharpe=0.724   PF=1.25  maxDD=0.79%
+n= 80  sharpe=1.029   PF=1.25  maxDD=0.79%
+```
+
+Same strategy, same per-trade stats — Sharpe triples. PF and max DD correctly stay flat.
+Any go-live threshold keyed to Sharpe will be crossed by persistence rather than performance.
+
+Fix: `periods_per_year = n / max(elapsed_days/365.25, 1e-9)`; multiply by
+`sqrt(periods_per_year)`. The same correction applies to Sortino at `:90`.
+
+**R2-8. Max drawdown and total return are computed on different bases.**
+`total_return_pct` uses `state["equity"]`, which **includes** funding. The `equity_curve`
+used for max DD and Sharpe is rebuilt from `SEED_EQUITY + sum(net_pnl)` (`engine.py:70-74`),
+which **excludes** funding — because `apply_funding` mutates equity directly and is never
+recorded in a trade. The two diverge by cumulative funding.
+
+Fix: persist an explicit equity-curve series in state (append on every equity change, trade
+or funding) and compute all curve metrics from it.
+
+### P3 — lower severity
+
+| # | Issue | Location |
+|---|---|---|
+| R2-9 | Circuit-breaker early `return`s skip the `self.state.save()` at the end of the function, so a rolled daily anchor may not persist on a tripped-breaker cycle — worst case in cron mode, where each run is a fresh process | `risk.py:86-116` |
+| R2-10 | `check_stops` mutates `pos["trail_watermark"]` with no `save()`; persistence depends on an unrelated later save | `orders.py:133,140` |
+| R2-11 | Stop/TP exits fill at last `price`, while entries pay `ask`/`bid` + slippage — exits are systematically cheaper than entries | `main.py:403` |
+| R2-12 | `high_24h` is set to `mkt.get("ask")` — mislabeled and unused | `main.py:158` |
+| R2-13 | Confidence comment says "scale 0.75x–1x"; code is `0.5 + conf*0.5` = 0.5x–1x | `main.py:315` |
+| R2-14 | Empty file named `=` committed to repo root (shell redirect artifact) | `./=` |
+
+### Open strategic question (not a bug — a decision to make explicitly)
+
+Round 2 kept the funding filter as a **veto**: when absolute funding is at or above 0.0001
+and funding disagrees with trend, no entry (`funding_momentum.py:182-186`). The comment says
+"confirmation filter, not veto," but the behavior is identical to round 1 — a `hold` return.
+
+That is a legitimate choice, but its consequence should be written down: funding is at or
+above 0.0001 on **46% of events** and negative on only **2 of 339 (0.6%)**. So during roughly
+half of all periods the system **cannot open a long at all**, and takes shorts only in
+downtrends. It sits out positive-funding uptrends entirely — historically the most common
+profitable BTC regime.
+
+Either accept this and document it as a deliberate short-biased carry strategy, or allow
+longs when trend is up and funding is positive but below a higher threshold. Track the
+long/short/no-trade regime split in the metrics either way — the tracker already reports a
+long/short split; add "cycles with no entry due to funding conflict."
+
+### What I could not verify
+
+- **No live paper results exist in the repo** (`data/` is gitignored), so this audit covers
+  code paths, not realised P&L. Once trades accumulate, check that `state["equity"]` and the
+  trade-derived equity curve agree (see R2-8) — divergence confirms the funding bug.
+- **`tests/smoke_test.py` was not executed** — it requires API credentials not present in
+  this environment. Note that it sets stops manually, so it does not cover R2-2.
+
+### Priority order
+
+1. R2-1 funding accrual (corrupts every P&L number, in the flattering direction)
+2. R2-2 trailing stop wiring (claimed protection that does not exist)
+3. R2-3 entry-gate bounds (2.5x more trades than intended, buys into collapses)
+4. R2-4 sizing multiplier (risk is 1.5x stated)
+5. R2-7 / R2-8 metrics (a go-live decision cannot be gated on these until both are fixed)
+6. Everything else
+
+**Treat paper results recorded before R2-1, R2-3, and R2-4 are fixed as void** — the funding
+bug inflates returns, the gate bug changes which trades are taken, and the sizing bug changes
+their magnitude.
