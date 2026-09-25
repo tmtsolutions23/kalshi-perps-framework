@@ -137,7 +137,7 @@ class MeanReversionStrategy(BaseStrategy):
             return Signal(
                 "hold",
                 reason=f"z={zscore:.2f}, waiting for reversion",
-                suggested_stop_loss=round(sl, 1),
+                suggested_stop_loss=round(sl, 4),
             )
 
         # Entry logic — removed the funding >= 0 / <= 0 gate (was structurally short-only)
@@ -150,8 +150,8 @@ class MeanReversionStrategy(BaseStrategy):
                 confidence=min(1.0, abs(zscore) / 4.0),
                 reason=f"Oversold z={zscore:.2f} (sma={sma:.1f})",
                 suggested_leverage=min(3.0, self.params.get("max_leverage", 3.0)),
-                suggested_stop_loss=round(sl, 1),
-                suggested_take_profit=round(tp, 1),
+                suggested_stop_loss=round(sl, 4),
+                suggested_take_profit=round(tp, 4),
             )
 
         if zscore >= entry_z:
@@ -163,8 +163,8 @@ class MeanReversionStrategy(BaseStrategy):
                 confidence=min(1.0, abs(zscore) / 4.0),
                 reason=f"Overbought z={zscore:.2f} (sma={sma:.1f})",
                 suggested_leverage=min(3.0, self.params.get("max_leverage", 3.0)),
-                suggested_stop_loss=round(sl, 1),
-                suggested_take_profit=round(tp, 1),
+                suggested_stop_loss=round(sl, 4),
+                suggested_take_profit=round(tp, 4),
             )
 
         return Signal("hold", reason=f"z={zscore:.2f} — no extreme")

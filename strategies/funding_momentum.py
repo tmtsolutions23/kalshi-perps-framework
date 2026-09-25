@@ -215,8 +215,8 @@ class FundingMomentumStrategy(BaseStrategy):
                             f"funding {fund:+.6f}" + (" (confirming)" if funding_bias else "")
                         ),
                         suggested_leverage=min(lev, 4.0),
-                        suggested_stop_loss=round(sl_price, 1),
-                        suggested_take_profit=round(tp_price, 1),
+                        suggested_stop_loss=round(sl_price, 4),
+                        suggested_take_profit=round(tp_price, 4),
                     )
 
             elif bias == "short":
@@ -235,8 +235,8 @@ class FundingMomentumStrategy(BaseStrategy):
                             f"funding {fund:+.6f}" + (" (confirming)" if funding_bias else "")
                         ),
                         suggested_leverage=min(lev, 4.0),
-                        suggested_stop_loss=round(sl_price, 1),
-                        suggested_take_profit=round(tp_price, 1),
+                        suggested_stop_loss=round(sl_price, 4),
+                        suggested_take_profit=round(tp_price, 4),
                     )
 
         else:

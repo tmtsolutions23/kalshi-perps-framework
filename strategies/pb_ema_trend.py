@@ -193,8 +193,8 @@ class PBEMATrendStrategy(BaseStrategy):
                     confidence=round(confidence, 2),
                     reason=f"Pullback {ema_dist_atr:.2f} ATRs from EMA{fast_period} in {regime}",
                     suggested_leverage=min(lev, 4.0),
-                    suggested_stop_loss=round(sl, 1),
-                    suggested_take_profit=round(tp, 1),
+                    suggested_stop_loss=round(sl, 4),
+                    suggested_take_profit=round(tp, 4),
                 )
 
             # Entry type 2: Breakout — price breaking above EMA with momentum
@@ -216,8 +216,8 @@ class PBEMATrendStrategy(BaseStrategy):
                         confidence=round(min(0.9, ema_dist_atr / 2.0), 2),
                         reason=f"Breakout {ema_dist_atr:.2f} ATRs (avg {avg_dist:.2f}) in {regime}",
                         suggested_leverage=min(lev, 4.0),
-                        suggested_stop_loss=round(sl, 1),
-                        suggested_take_profit=round(tp, 1),
+                        suggested_stop_loss=round(sl, 4),
+                        suggested_take_profit=round(tp, 4),
                     )
 
         elif regime == "DOWN":
@@ -235,8 +235,8 @@ class PBEMATrendStrategy(BaseStrategy):
                     confidence=round(confidence, 2),
                     reason=f"Pullback {ema_dist_atr:.2f} ATRs from EMA{fast_period} in {regime}",
                     suggested_leverage=min(lev, 4.0),
-                    suggested_stop_loss=round(sl, 1),
-                    suggested_take_profit=round(tp, 1),
+                    suggested_stop_loss=round(sl, 4),
+                    suggested_take_profit=round(tp, 4),
                 )
 
             # Entry type 2: Breakdown — price breaking below EMA with momentum
@@ -256,8 +256,8 @@ class PBEMATrendStrategy(BaseStrategy):
                         confidence=round(min(0.9, abs(ema_dist_atr) / 2.0), 2),
                         reason=f"Breakdown {ema_dist_atr:.2f} ATRs (avg {avg_dist:.2f}) in {regime}",
                         suggested_leverage=min(lev, 4.0),
-                        suggested_stop_loss=round(sl, 1),
-                        suggested_take_profit=round(tp, 1),
+                        suggested_stop_loss=round(sl, 4),
+                        suggested_take_profit=round(tp, 4),
                     )
 
         return Signal("hold", reason=f"Entry conditions not met in {regime}")
