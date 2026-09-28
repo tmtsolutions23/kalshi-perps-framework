@@ -1,7 +1,7 @@
 # Project Progress — Kalshi BTC Perps Trading Framework
 
 **Repo:** `github.com/tmtsolutions23/kalshi-perps-framework`
-**Status:** All P0-P4 audit findings fixed. Running on main via cron (every 4h, paper mode, zero LLM tokens).
+**Status:** ⛔ SHELVED 2026-09-28 — cron `47c8dfe1c7c5` paused by user. Project closed after 80 cycles / 0 closed trades. Code intact; artifacts retained.
 
 ---
 
@@ -560,3 +560,42 @@ Audit data showed:
 - Removed unused `bo_runup` variable from `pb_ema_trend.py`
 - Verified all 11 smoke tests pass including PB-EMA regime assertions
 - Verified live cycle detects UP regime and fires long pullback
+
+---
+
+## 2026-09-28 — Project shelved
+
+**Decision:** User closed the project. Honest result: it did not prove itself.
+
+**Final state (after 80 hourly cycles, ~4 days):**
+
+| Metric | Value |
+|---|---|
+| Starting equity | $500.00 |
+| Final equity | $499.78 (funding payments only) |
+| Closed trades | **0** |
+| Open position at close | LONG 53 @ $8.4050 (unrealized −$4.56) |
+| Errors | 0 |
+| Cron | `47c8dfe1c7c5` — **paused** (was `every 60m`) |
+
+**Why it didn't produce a verdict:**
+
+- Only **one** entry fired in 80 cycles. The PB-EMA(50) daily trend filter sat in UP for
+  the entire period, and the pullback entry condition triggered exactly once.
+- Because 4h ATR stops (2.2% SL / 4.4% TP) were deliberately widened at the user's
+  request, that single position never resolved in either direction — it just drifted.
+- Net result: **0 closed trades = no evidence either way.** The framework ran cleanly
+  but never generated the sample size needed to judge the strategy. A framework that
+  doesn't trade can't validate anything.
+
+**What was learned (worth keeping):**
+
+- Trend-filter + single-entry-per-regime designs produce pathetically thin trade counts
+  over short windows. Any future attempt needs far higher entry frequency or a much
+  longer evaluation horizon before it can be judged.
+- The 2-4× leverage / wide-stop / high-TP configuration the user wanted is incompatible
+  with the "prove it quickly on $500" cadence — wide stops mean slow resolution.
+- Zero LLM tokens at runtime worked as designed: no cost, no babysitting.
+
+**Artifacts retained:** repo + local `/root/agentic-trading/kalshi-perps` left intact
+(not deleted). Recoverable via `cronjob_manage resume` on job `47c8dfe1c7c5`.
